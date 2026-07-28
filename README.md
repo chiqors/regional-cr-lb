@@ -38,6 +38,14 @@ One IP is shared across multiple hostnames. Routing happens by hostname, not by 
 
 - `SERVICE_MAPPINGS`
 
+### Optional Cloudflare DNS Automation
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ZONE_ID` or `CLOUDFLARE_ZONE_NAME` if you want to skip auto-discovery
+- `CLOUDFLARE_TTL`
+- `CLOUDFLARE_A_PROXIED`
+- `DELETE_CLOUDFLARE_DNS` for uninstall cleanup
+
 Format:
 
 ```bash
@@ -112,6 +120,32 @@ _acme-challenge_xxx.api.example.com.   CNAME  xxx.authorize.certificatemanager.g
 _acme-challenge_xxx.app.example.com.   CNAME  xxx.authorize.certificatemanager.goog.
 ```
 
+## Optional: Create DNS Records In Cloudflare Automatically
+
+If you use Cloudflare DNS, step 2 can create or update:
+
+- one `A` record per hostname pointing to the shared load balancer IP
+- one ACME `CNAME` record per hostname from Certificate Manager
+
+Example:
+
+```bash
+PROJECT_ID=my-gcp-project \
+REGION=asia-southeast2 \
+ADDRESS_NAME=my-regional-lb-ip \
+SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
+CLOUDFLARE_API_TOKEN=your-cloudflare-api-token \
+CLOUDFLARE_ZONE_NAME=example.com \
+./02-finish-regional-cloud-run-lb.sh
+```
+
+Notes:
+
+- If `CLOUDFLARE_ZONE_ID` or `CLOUDFLARE_ZONE_NAME` is not set, the script tries to discover the zone from each hostname.
+- `CLOUDFLARE_A_PROXIED` defaults to `false`, which is the safe default for Google-managed certificate validation.
+- `CLOUDFLARE_TTL` defaults to `1`, which means Cloudflare automatic TTL.
+- The token should be able to edit DNS records. If you rely on zone auto-discovery, it also needs permission to read zones.
+
 ## When Certificates Are Still Provisioning
 
 This is normal on the first run.
@@ -161,6 +195,19 @@ SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service'
 ./03-uninstall-regional-cloud-run-lb.sh
 ```
 
+### Remove LB Resources And Cloudflare DNS Records
+
+```bash
+PROJECT_ID=my-gcp-project \
+REGION=asia-southeast2 \
+ADDRESS_NAME=my-regional-lb-ip \
+SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
+DELETE_CLOUDFLARE_DNS=true \
+CLOUDFLARE_API_TOKEN=your-cloudflare-api-token \
+CLOUDFLARE_ZONE_NAME=example.com \
+./03-uninstall-regional-cloud-run-lb.sh
+```
+
 ### Remove LB Resources And The IP
 
 ```bash
@@ -184,7 +231,7 @@ SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service'
 ./03-uninstall-regional-cloud-run-lb.sh
 ```
 
-Also remove the DNS records manually from your DNS provider:
+If you do not use `DELETE_CLOUDFLARE_DNS=true`, remove the DNS records manually from your DNS provider:
 - `A` records
 - `_acme-challenge...` `CNAME` records
 
@@ -193,8 +240,10 @@ Also remove the DNS records manually from your DNS provider:
 - The scripts are idempotent and intended for reruns.
 - `PROJECT_ID`, `REGION`, and `ADDRESS_NAME` are required for all scripts.
 - `SERVICE_MAPPINGS` is required for step 2 and optional in step 3.
+- Cloudflare automation in step 2 is enabled when `CLOUDFLARE_API_TOKEN` is set.
 - Resource names are auto-generated from hostnames and truncated to fit GCP limits.
 - The scripts are written to work with macOS system Bash.
+- Cloudflare automation uses `curl` and `python3`.
 - The setup assumes all mapped Cloud Run services are in the same region.
 - The ADC quota-project warning from `gcloud` does not block this setup.
 - The Python deprecation warning from `gcloud` does not block this setup.
