@@ -22,6 +22,7 @@ WAIT_FOR_CERT="${WAIT_FOR_CERT:-false}"
 CERT_WAIT_TIMEOUT_SECONDS="${CERT_WAIT_TIMEOUT_SECONDS:-3600}"
 CERT_POLL_SECONDS="${CERT_POLL_SECONDS:-30}"
 SKIP_CERT_ATTACH="${SKIP_CERT_ATTACH:-false}"
+WILDCARD_DOMAIN="${WILDCARD_DOMAIN:-}"
 
 CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
@@ -110,7 +111,13 @@ short_name() {
 }
 
 parse_mappings() {
-  local raw host service slug neg_name backend_name cert_name auth_name
+  local raw host service slug neg_name backend_name cert_name auth_name label
+
+  WILDCARD_DOMAIN="$(strip_trailing_dot "$WILDCARD_DOMAIN")"
+  if [[ -n "$WILDCARD_DOMAIN" && ! "$WILDCARD_DOMAIN" =~ ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$ ]]; then
+    echo "WILDCARD_DOMAIN must be a parent domain such as photon-indonesia.org." >&2
+    exit 1
+  fi
 
   IFS=',' read -r -a RAW_MAPPINGS <<<"$SERVICE_MAPPINGS"
   if [[ "${#RAW_MAPPINGS[@]}" -eq 0 ]]; then
@@ -144,6 +151,14 @@ parse_mappings() {
       exit 1
     fi
 
+    if [[ -n "$WILDCARD_DOMAIN" ]]; then
+      label="${host%."$WILDCARD_DOMAIN"}"
+      if [[ "$host" != *."$WILDCARD_DOMAIN" || -z "$label" || "$label" == *.* ]]; then
+        echo "Host '$host' is not covered by *.$WILDCARD_DOMAIN (one subdomain level only)." >&2
+        exit 1
+      fi
+    fi
+
     neg_name="$(short_name "$LB_NAME_PREFIX" "$slug" "neg")"
     backend_name="$(short_name "$LB_NAME_PREFIX" "$slug" "backend")"
     cert_name="$(short_name "$LB_NAME_PREFIX" "$slug" "cert")"
@@ -154,13 +169,21 @@ parse_mappings() {
     HOST_SLUGS+=("$slug")
     NEG_NAMES+=("$neg_name")
     BACKEND_NAMES+=("$backend_name")
-    CERT_NAMES+=("$cert_name")
-    DNS_AUTH_NAMES+=("$auth_name")
+    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+      CERT_NAMES+=("$cert_name")
+      DNS_AUTH_NAMES+=("$auth_name")
+    fi
   done
 
   if [[ "${#HOSTS[@]}" -eq 0 ]]; then
     echo "SERVICE_MAPPINGS did not produce any usable mappings." >&2
     exit 1
+  fi
+
+  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+    slug="$(slugify "$WILDCARD_DOMAIN")"
+    CERT_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "wildcard-cert")")
+    DNS_AUTH_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "wildcard-dns-auth")")
   fi
 }
 
@@ -363,18 +386,27 @@ ensure_cloudflare_dns_record() {
   log "Updated Cloudflare DNS record: ${type} ${name} -> ${content}"
 }
 
+ensure_cloudflare_dns_authorization_record() {
+  local auth_name="$1"
+  local domain="$2"
+  local acme_name acme_target
+
+  find_cloudflare_zone_for_host "$domain"
+  acme_name="$(strip_trailing_dot "$(get_dns_auth_record_name "$auth_name")")"
+  acme_target="$(strip_trailing_dot "$(get_dns_auth_record_data "$auth_name")")"
+  ensure_cloudflare_dns_record "$CF_RESOLVED_ZONE_ID" "CNAME" "$acme_name" "$acme_target" "false"
+}
+
 ensure_cloudflare_dns_records() {
   local lb_ip="$1"
   local host="$2"
   local auth_name="$3"
-  local acme_name acme_target
 
   find_cloudflare_zone_for_host "$host"
   ensure_cloudflare_dns_record "$CF_RESOLVED_ZONE_ID" "A" "$host" "$lb_ip" "$CLOUDFLARE_A_PROXIED"
-
-  acme_name="$(strip_trailing_dot "$(get_dns_auth_record_name "$auth_name")")"
-  acme_target="$(strip_trailing_dot "$(get_dns_auth_record_data "$auth_name")")"
-  ensure_cloudflare_dns_record "$CF_RESOLVED_ZONE_ID" "CNAME" "$acme_name" "$acme_target" "false"
+  if [[ -n "$auth_name" ]]; then
+    ensure_cloudflare_dns_authorization_record "$auth_name" "$host"
+  fi
 }
 
 ensure_project() {
@@ -766,8 +798,8 @@ EOF
   done
 
   printf '\nCertificate Manager DNS authorization records:\n'
-  for i in "${!HOSTS[@]}"; do
-    printf '\n[%s]\n' "${HOSTS[$i]}"
+  for i in "${!DNS_AUTH_NAMES[@]}"; do
+    printf '\n[%s]\n' "${WILDCARD_DOMAIN:-${HOSTS[$i]}}"
     print_dns_authorization_records "${DNS_AUTH_NAMES[$i]}"
   done
 }
@@ -793,12 +825,28 @@ main() {
   for i in "${!HOSTS[@]}"; do
     ensure_serverless_neg "${NEG_NAMES[$i]}" "${SERVICES[$i]}"
     ensure_backend_service "${BACKEND_NAMES[$i]}" "${NEG_NAMES[$i]}"
-    ensure_dns_authorization "${DNS_AUTH_NAMES[$i]}" "${HOSTS[$i]}"
-    if cloudflare_dns_enabled; then
-      ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" "${DNS_AUTH_NAMES[$i]}"
+    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+      ensure_dns_authorization "${DNS_AUTH_NAMES[$i]}" "${HOSTS[$i]}"
     fi
-    ensure_certificate "${CERT_NAMES[$i]}" "${DNS_AUTH_NAMES[$i]}" "${HOSTS[$i]}"
+    if cloudflare_dns_enabled; then
+      if [[ -n "$WILDCARD_DOMAIN" ]]; then
+        ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" ""
+      else
+        ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" "${DNS_AUTH_NAMES[$i]}"
+      fi
+    fi
+    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+      ensure_certificate "${CERT_NAMES[$i]}" "${DNS_AUTH_NAMES[$i]}" "${HOSTS[$i]}"
+    fi
   done
+
+  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+    ensure_dns_authorization "${DNS_AUTH_NAMES[0]}" "$WILDCARD_DOMAIN"
+    if cloudflare_dns_enabled; then
+      ensure_cloudflare_dns_authorization_record "${DNS_AUTH_NAMES[0]}" "$WILDCARD_DOMAIN"
+    fi
+    ensure_certificate "${CERT_NAMES[0]}" "${DNS_AUTH_NAMES[0]}" "*.$WILDCARD_DOMAIN"
+  fi
 
   ensure_url_maps
 

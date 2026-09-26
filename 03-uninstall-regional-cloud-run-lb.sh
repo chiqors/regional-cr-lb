@@ -22,6 +22,7 @@ DELETE_LB_CORE="${DELETE_LB_CORE:-true}"
 DELETE_ADDRESS="${DELETE_ADDRESS:-false}"
 DELETE_NETWORK="${DELETE_NETWORK:-false}"
 DELETE_CLOUDFLARE_DNS="${DELETE_CLOUDFLARE_DNS:-false}"
+WILDCARD_DOMAIN="${WILDCARD_DOMAIN:-}"
 
 CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
@@ -241,18 +242,13 @@ get_dns_auth_record_name_if_present() {
 }
 
 parse_mappings() {
-  local raw host service slug
+  local raw host service slug label
 
-  if [[ -z "$SERVICE_MAPPINGS" ]]; then
-    HOSTS=()
-    NEG_NAMES=()
-    BACKEND_NAMES=()
-    CERT_NAMES=()
-    DNS_AUTH_NAMES=()
-    return 0
+  WILDCARD_DOMAIN="$(strip_trailing_dot "$WILDCARD_DOMAIN")"
+  if [[ -n "$WILDCARD_DOMAIN" && ! "$WILDCARD_DOMAIN" =~ ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$ ]]; then
+    echo "WILDCARD_DOMAIN must be a parent domain such as photon-indonesia.org." >&2
+    exit 1
   fi
-
-  IFS=',' read -r -a RAW_MAPPINGS <<<"$SERVICE_MAPPINGS"
 
   HOSTS=()
   NEG_NAMES=()
@@ -260,6 +256,10 @@ parse_mappings() {
   CERT_NAMES=()
   DNS_AUTH_NAMES=()
 
+  RAW_MAPPINGS=("")
+  if [[ -n "$SERVICE_MAPPINGS" ]]; then
+    IFS=',' read -r -a RAW_MAPPINGS <<<"$SERVICE_MAPPINGS"
+  fi
   for raw in "${RAW_MAPPINGS[@]}"; do
     raw="$(trim "$raw")"
     [[ -z "$raw" ]] && continue
@@ -278,12 +278,28 @@ parse_mappings() {
       exit 1
     fi
 
+    if [[ -n "$WILDCARD_DOMAIN" ]]; then
+      label="${host%."$WILDCARD_DOMAIN"}"
+      if [[ "$host" != *."$WILDCARD_DOMAIN" || -z "$label" || "$label" == *.* ]]; then
+        echo "Host '$host' is not covered by *.$WILDCARD_DOMAIN (one subdomain level only)." >&2
+        exit 1
+      fi
+    fi
+
     HOSTS+=("$host")
     NEG_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "neg")")
     BACKEND_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "backend")")
-    CERT_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "cert")")
-    DNS_AUTH_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "dns-auth")")
+    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+      CERT_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "cert")")
+      DNS_AUTH_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "dns-auth")")
+    fi
   done
+
+  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+    slug="$(slugify "$WILDCARD_DOMAIN")"
+    CERT_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "wildcard-cert")")
+    DNS_AUTH_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "wildcard-dns-auth")")
+  fi
 }
 
 delete_if_exists() {
@@ -300,19 +316,9 @@ delete_if_exists() {
 delete_mapping_resources() {
   local i
   for i in "${!HOSTS[@]}"; do
-    delete_if_exists \
-      "gcloud certificate-manager certificates describe '${CERT_NAMES[$i]}' --project='$PROJECT_ID' --location='$REGION'" \
-      gcloud certificate-manager certificates delete "${CERT_NAMES[$i]}" \
-        --project="$PROJECT_ID" \
-        --location="$REGION" \
-        --quiet
-
-    delete_if_exists \
-      "gcloud certificate-manager dns-authorizations describe '${DNS_AUTH_NAMES[$i]}' --project='$PROJECT_ID' --location='$REGION'" \
-      gcloud certificate-manager dns-authorizations delete "${DNS_AUTH_NAMES[$i]}" \
-        --project="$PROJECT_ID" \
-        --location="$REGION" \
-        --quiet
+    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+      delete_certificate_resources "${CERT_NAMES[$i]}" "${DNS_AUTH_NAMES[$i]}"
+    fi
 
     delete_if_exists \
       "gcloud compute backend-services describe '${BACKEND_NAMES[$i]}' --project='$PROJECT_ID' --region='$REGION'" \
@@ -328,6 +334,29 @@ delete_mapping_resources() {
         --region="$REGION" \
         --quiet
   done
+
+  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+    delete_certificate_resources "${CERT_NAMES[0]}" "${DNS_AUTH_NAMES[0]}"
+  fi
+}
+
+delete_certificate_resources() {
+  local cert_name="$1"
+  local auth_name="$2"
+
+  delete_if_exists \
+    "gcloud certificate-manager certificates describe '$cert_name' --project='$PROJECT_ID' --location='$REGION'" \
+    gcloud certificate-manager certificates delete "$cert_name" \
+      --project="$PROJECT_ID" \
+      --location="$REGION" \
+      --quiet
+
+  delete_if_exists \
+    "gcloud certificate-manager dns-authorizations describe '$auth_name' --project='$PROJECT_ID' --location='$REGION'" \
+    gcloud certificate-manager dns-authorizations delete "$auth_name" \
+      --project="$PROJECT_ID" \
+      --location="$REGION" \
+      --quiet
 }
 
 delete_cloudflare_dns_records() {
@@ -337,13 +366,25 @@ delete_cloudflare_dns_records() {
     find_cloudflare_zone_for_host "${HOSTS[$i]}"
     delete_cloudflare_dns_record_if_present "$CF_RESOLVED_ZONE_ID" "A" "${HOSTS[$i]}"
 
-    auth_record_name="$(strip_trailing_dot "$(get_dns_auth_record_name_if_present "${DNS_AUTH_NAMES[$i]}")")"
-    if [[ -n "$auth_record_name" ]]; then
-      delete_cloudflare_dns_record_if_present "$CF_RESOLVED_ZONE_ID" "CNAME" "$auth_record_name"
-    else
-      log "Skipping missing DNS authorization lookup for ${HOSTS[$i]} when removing Cloudflare ACME CNAME"
+    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+      auth_record_name="$(strip_trailing_dot "$(get_dns_auth_record_name_if_present "${DNS_AUTH_NAMES[$i]}")")"
+      if [[ -n "$auth_record_name" ]]; then
+        delete_cloudflare_dns_record_if_present "$CF_RESOLVED_ZONE_ID" "CNAME" "$auth_record_name"
+      else
+        log "Skipping missing DNS authorization lookup for ${HOSTS[$i]} when removing Cloudflare ACME CNAME"
+      fi
     fi
   done
+
+  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+    auth_record_name="$(strip_trailing_dot "$(get_dns_auth_record_name_if_present "${DNS_AUTH_NAMES[0]}")")"
+    if [[ -n "$auth_record_name" ]]; then
+      find_cloudflare_zone_for_host "$WILDCARD_DOMAIN"
+      delete_cloudflare_dns_record_if_present "$CF_RESOLVED_ZONE_ID" "CNAME" "$auth_record_name"
+    else
+      log "Skipping missing DNS authorization lookup for $WILDCARD_DOMAIN when removing Cloudflare ACME CNAME"
+    fi
+  fi
 }
 
 delete_lb_core() {
@@ -430,7 +471,7 @@ Cloudflare DNS:  $DELETE_CLOUDFLARE_DNS
 Mappings removed: ${#HOSTS[@]}
 EOF
 
-  if [[ "${#HOSTS[@]}" -gt 0 ]]; then
+  if [[ "${#HOSTS[@]}" -gt 0 || -n "$WILDCARD_DOMAIN" ]]; then
     local i
     printf '\nHosts processed:\n'
     for i in "${!HOSTS[@]}"; do
