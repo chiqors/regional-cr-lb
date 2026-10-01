@@ -89,8 +89,8 @@ Run step 2 after step 1.
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
-SERVICE_MAPPINGS='api.example.com=my-api-service' \
+ADDRESS_NAME=cloud-run-reg-ext-lb-ip \
+SERVICE_MAPPINGS='dashboard-management.c-grhen.org=photon-dashboard-management,dashboard-trial.c-grhen.org=photon-dashboard,prototype.c-grhen.org=photon-prototype' \
 ./02-finish-regional-cloud-run-lb.sh
 ```
 
@@ -103,6 +103,8 @@ What step 2 does:
 - with `WILDCARD_DOMAIN`, creates one authorization for the parent domain and one shared wildcard certificate
 - when certificates are active, creates HTTPS and HTTP proxies plus forwarding rules
 - enables HTTP to HTTPS redirect
+
+By default, step 2 does not wait for certificates. If any are still provisioning, it prints the required DNS records and exits without creating the frontends. Rerun step 2 after the certificates become active.
 
 ## DNS Records You Must Add
 
@@ -167,11 +169,11 @@ Notes:
 
 ## When Certificates Are Still Provisioning
 
-This is normal on the first run.
+This is normal on the first run. Certificate Manager DNS authorization can take several minutes to activate.
 
-If step 2 prints certificate state `PROVISIONING`, add the missing DNS `CNAME` records and rerun the same command later.
+For a single run, set `WAIT_FOR_CERT=true`. Step 2 prints the required `A` and Certificate Manager `CNAME` records before polling. Add or verify those records in your DNS provider while the command remains running. Once all certificates are active, the script creates the proxies and forwarding rules automatically.
 
-Optional: let the script wait automatically.
+The default wait timeout is one hour. Set `CERT_WAIT_TIMEOUT_SECONDS` to change it. If the command times out, it exits with an error; after resolving any DNS issue, rerun step 2.
 
 ```bash
 WAIT_FOR_CERT=true \

@@ -599,6 +599,28 @@ print_dns_authorization_records() {
     --format='yaml(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)'
 }
 
+print_dns_setup_instructions() {
+  local ip i
+  ip="$(get_lb_ip)"
+
+  cat <<EOF
+
+DNS records to configure while waiting for certificate activation
+-----------------------------------------------------------------
+A records:
+EOF
+  for i in "${!HOSTS[@]}"; do
+    printf '%s. %s -> %s\n' "$((i + 1))" "${HOSTS[$i]}" "$ip"
+  done
+
+  printf '\nCertificate Manager CNAME records:\n'
+  for i in "${!DNS_AUTH_NAMES[@]}"; do
+    printf '\n[%s]\n' "${WILDCARD_DOMAIN:-${HOSTS[$i]}}"
+    print_dns_authorization_records "${DNS_AUTH_NAMES[$i]}"
+  done
+  printf '\nAdd or verify these records now; this process will continue polling.\n\n'
+}
+
 ensure_certificate() {
   local cert_name="$1"
   local auth_name="$2"
@@ -659,6 +681,7 @@ wait_for_active_certificates_if_requested() {
     return 1
   fi
 
+  print_dns_setup_instructions
   log "Waiting for all certificates to become ACTIVE"
   while (( waited < CERT_WAIT_TIMEOUT_SECONDS )); do
     sleep "$CERT_POLL_SECONDS"
@@ -674,7 +697,7 @@ wait_for_active_certificates_if_requested() {
   done
 
   warn "Timed out waiting for certificate activation after ${CERT_WAIT_TIMEOUT_SECONDS}s."
-  return 1
+  return 2
 }
 
 join_by_comma() {
@@ -819,7 +842,7 @@ main() {
   ensure_proxy_subnet
   ensure_address_exists
 
-  local i
+  local i wait_status
   local lb_ip
   lb_ip="$(get_lb_ip)"
   for i in "${!HOSTS[@]}"; do
@@ -855,6 +878,12 @@ main() {
     ensure_http_proxy
     ensure_https_forwarding_rule
     ensure_http_forwarding_rule
+  else
+    wait_status=$?
+    if (( wait_status == 2 )); then
+      print_summary
+      return 1
+    fi
   fi
 
   print_summary
