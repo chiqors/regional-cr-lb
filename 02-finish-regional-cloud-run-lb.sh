@@ -23,6 +23,7 @@ CERT_WAIT_TIMEOUT_SECONDS="${CERT_WAIT_TIMEOUT_SECONDS:-3600}"
 CERT_POLL_SECONDS="${CERT_POLL_SECONDS:-30}"
 SKIP_CERT_ATTACH="${SKIP_CERT_ATTACH:-false}"
 WILDCARD_DOMAIN="${WILDCARD_DOMAIN:-}"
+ENABLE_HTTPS="${ENABLE_HTTPS:-true}"
 
 CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
@@ -413,8 +414,10 @@ ensure_project() {
   run gcloud config set project "$PROJECT_ID"
   run gcloud services enable \
     run.googleapis.com \
-    compute.googleapis.com \
-    certificatemanager.googleapis.com
+    compute.googleapis.com
+  if bool_is_true "$ENABLE_HTTPS"; then
+    run gcloud services enable certificatemanager.googleapis.com
+  fi
 }
 
 ensure_cloud_run_services() {
@@ -556,10 +559,8 @@ EOF
 
 ensure_url_maps() {
   local main_map_file
-  local redirect_map_file
 
   main_map_file="$(render_main_url_map)"
-  redirect_map_file="$(render_redirect_url_map)"
 
   run gcloud compute url-maps import "$URL_MAP_NAME" \
     --project="$PROJECT_ID" \
@@ -567,11 +568,15 @@ ensure_url_maps() {
     --source="$main_map_file" \
     --quiet
 
-  run gcloud compute url-maps import "$REDIRECT_URL_MAP_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --source="$redirect_map_file" \
-    --quiet
+  if bool_is_true "$ENABLE_HTTPS"; then
+    local redirect_map_file
+    redirect_map_file="$(render_redirect_url_map)"
+    run gcloud compute url-maps import "$REDIRECT_URL_MAP_NAME" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --source="$redirect_map_file" \
+      --quiet
+  fi
 }
 
 ensure_dns_authorization() {
@@ -734,18 +739,23 @@ ensure_https_proxy() {
 }
 
 ensure_http_proxy() {
+  local proxy_url_map="$REDIRECT_URL_MAP_NAME"
+  if ! bool_is_true "$ENABLE_HTTPS"; then
+    proxy_url_map="$URL_MAP_NAME"
+  fi
+
   if ! resource_exists gcloud compute target-http-proxies describe "$HTTP_PROXY_NAME" \
     --project="$PROJECT_ID" \
     --region="$REGION"; then
     run gcloud compute target-http-proxies create "$HTTP_PROXY_NAME" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
-      --url-map="$REDIRECT_URL_MAP_NAME"
+      --url-map="$proxy_url_map"
   else
     run gcloud compute target-http-proxies update "$HTTP_PROXY_NAME" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
-      --url-map="$REDIRECT_URL_MAP_NAME"
+      --url-map="$proxy_url_map"
   fi
 }
 
@@ -814,17 +824,21 @@ EOF
     printf '%s. %s -> %s\n' "$((i + 1))" "${HOSTS[$i]}" "$ip"
   done
 
-  printf '\nCertificate states:\n'
-  for cert_name in "${CERT_NAMES[@]}"; do
-    state="$(get_cert_state "$cert_name")"
-    printf -- '- %s: %s\n' "$cert_name" "${state:-UNKNOWN}"
-  done
+  if bool_is_true "$ENABLE_HTTPS"; then
+    printf '\nCertificate states:\n'
+    for cert_name in "${CERT_NAMES[@]}"; do
+      state="$(get_cert_state "$cert_name")"
+      printf -- '- %s: %s\n' "$cert_name" "${state:-UNKNOWN}"
+    done
 
-  printf '\nCertificate Manager DNS authorization records:\n'
-  for i in "${!DNS_AUTH_NAMES[@]}"; do
-    printf '\n[%s]\n' "${WILDCARD_DOMAIN:-${HOSTS[$i]}}"
-    print_dns_authorization_records "${DNS_AUTH_NAMES[$i]}"
-  done
+    printf '\nCertificate Manager DNS authorization records:\n'
+    for i in "${!DNS_AUTH_NAMES[@]}"; do
+      printf '\n[%s]\n' "${WILDCARD_DOMAIN:-${HOSTS[$i]}}"
+      print_dns_authorization_records "${DNS_AUTH_NAMES[$i]}"
+    done
+  else
+    printf '\nFrontend: HTTP only (port 80)\n'
+  fi
 }
 
 main() {
@@ -848,22 +862,24 @@ main() {
   for i in "${!HOSTS[@]}"; do
     ensure_serverless_neg "${NEG_NAMES[$i]}" "${SERVICES[$i]}"
     ensure_backend_service "${BACKEND_NAMES[$i]}" "${NEG_NAMES[$i]}"
-    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+    if bool_is_true "$ENABLE_HTTPS" && [[ -z "$WILDCARD_DOMAIN" ]]; then
       ensure_dns_authorization "${DNS_AUTH_NAMES[$i]}" "${HOSTS[$i]}"
     fi
     if cloudflare_dns_enabled; then
       if [[ -n "$WILDCARD_DOMAIN" ]]; then
         ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" ""
-      else
+      elif bool_is_true "$ENABLE_HTTPS"; then
         ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" "${DNS_AUTH_NAMES[$i]}"
+      else
+        ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" ""
       fi
     fi
-    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+    if bool_is_true "$ENABLE_HTTPS" && [[ -z "$WILDCARD_DOMAIN" ]]; then
       ensure_certificate "${CERT_NAMES[$i]}" "${DNS_AUTH_NAMES[$i]}" "${HOSTS[$i]}"
     fi
   done
 
-  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+  if bool_is_true "$ENABLE_HTTPS" && [[ -n "$WILDCARD_DOMAIN" ]]; then
     ensure_dns_authorization "${DNS_AUTH_NAMES[0]}" "$WILDCARD_DOMAIN"
     if cloudflare_dns_enabled; then
       ensure_cloudflare_dns_authorization_record "${DNS_AUTH_NAMES[0]}" "$WILDCARD_DOMAIN"
@@ -873,7 +889,11 @@ main() {
 
   ensure_url_maps
 
-  if wait_for_active_certificates_if_requested; then
+  if ! bool_is_true "$ENABLE_HTTPS"; then
+    log "ENABLE_HTTPS=false: configuring HTTP only on port 80"
+    ensure_http_proxy
+    ensure_http_forwarding_rule
+  elif wait_for_active_certificates_if_requested; then
     ensure_https_proxy
     ensure_http_proxy
     ensure_https_forwarding_rule

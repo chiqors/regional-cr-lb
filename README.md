@@ -1,6 +1,6 @@
 # Regional Cloud Run LB Usage
 
-This setup uses a shared `Regional external HTTPS Load Balancer` in front of one or more Cloud Run services.
+This setup uses a shared `Regional external managed Load Balancer` in front of one or more Cloud Run services. HTTPS is enabled by default, with an HTTP-only option.
 
 What you get:
 - one shared regional static external IP
@@ -38,6 +38,7 @@ One IP is shared across multiple hostnames. Routing happens by hostname, not by 
 
 - `SERVICE_MAPPINGS`
 - `WILDCARD_DOMAIN` (optional; use one certificate for `*.example.com` instead of one per hostname)
+- `ENABLE_HTTPS` (optional; defaults to `true`; set to `false` for an HTTP-only frontend on port 80)
 
 ### Optional Cloudflare DNS Automation
 
@@ -106,13 +107,38 @@ What step 2 does:
 
 By default, step 2 does not wait for certificates. If any are still provisioning, it prints the required DNS records and exits without creating the frontends. Rerun step 2 after the certificates become active.
 
+### HTTP-only mode
+
+To expose the regional load balancer over plain HTTP, set `ENABLE_HTTPS=false`:
+
+```bash
+PROJECT_ID=my-gcp-project \
+REGION=asia-southeast2 \
+ADDRESS_NAME=cloud-run-reg-ext-lb-ip \
+SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
+ENABLE_HTTPS=false \
+./02-finish-regional-cloud-run-lb.sh
+```
+
+This creates only the regional HTTP proxy and forwarding rule on port 80. The normal host-based URL map is attached directly, so requests with `Host: api.example.com` or `Host: app.example.com` route to their matching Cloud Run service. Certificate Manager resources are not created or required. The existing HTTPS behavior remains the default when `ENABLE_HTTPS` is omitted.
+
+If you previously ran HTTPS mode, this updates the HTTP proxy to serve requests directly, but leaves existing HTTPS forwarding rules, proxies, certificates, and the redirect URL map in place. It does not delete existing resources.
+
 ## DNS Records You Must Add
 
 For each hostname in `SERVICE_MAPPINGS`, create:
 
 - one `A` record pointing to the shared IP from step 1
-- by default, one `_acme-challenge...` `CNAME` record printed by step 2
-- with `WILDCARD_DOMAIN`, only the one `CNAME` record printed for the parent domain
+- in HTTPS mode, by default, one `_acme-challenge...` `CNAME` record printed by step 2
+- in HTTPS mode with `WILDCARD_DOMAIN`, only the one `CNAME` record printed for the parent domain
+
+HTTP-only mode does not need Certificate Manager DNS authorization records. Test a mapped hostname with its `Host` header, for example:
+
+```bash
+curl -i -H 'Host: api.example.com' http://35.219.10.153/
+```
+
+Opening `http://35.219.10.153/` without a hostname uses the URL map's default backend (`SERVICE_MAPPINGS`' first entry).
 
 Example shape:
 
