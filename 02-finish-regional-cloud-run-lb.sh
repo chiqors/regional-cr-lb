@@ -760,6 +760,9 @@ ensure_http_proxy() {
 }
 
 ensure_https_forwarding_rule() {
+  local desired_ip current_ip
+  desired_ip="$(get_lb_ip)"
+
   if ! resource_exists gcloud compute forwarding-rules describe "$HTTPS_FWD_RULE_NAME" \
     --project="$PROJECT_ID" \
     --region="$REGION"; then
@@ -774,11 +777,36 @@ ensure_https_forwarding_rule() {
       --ports=443 \
       --network-tier=STANDARD
   else
-    log "HTTPS forwarding rule $HTTPS_FWD_RULE_NAME already exists"
+    current_ip="$(gcloud compute forwarding-rules describe "$HTTPS_FWD_RULE_NAME" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --format='value(IPAddress)')"
+    if [[ "$current_ip" != "$desired_ip" ]]; then
+      warn "HTTPS forwarding rule $HTTPS_FWD_RULE_NAME uses $current_ip; recreating it on $desired_ip"
+      run gcloud compute forwarding-rules delete "$HTTPS_FWD_RULE_NAME" \
+        --project="$PROJECT_ID" \
+        --region="$REGION" \
+        --quiet
+      run gcloud compute forwarding-rules create "$HTTPS_FWD_RULE_NAME" \
+        --project="$PROJECT_ID" \
+        --region="$REGION" \
+        --load-balancing-scheme=EXTERNAL_MANAGED \
+        --network="$LB_NETWORK" \
+        --address="$ADDRESS_NAME" \
+        --target-https-proxy="$HTTPS_PROXY_NAME" \
+        --target-https-proxy-region="$REGION" \
+        --ports=443 \
+        --network-tier=STANDARD
+    else
+      log "HTTPS forwarding rule $HTTPS_FWD_RULE_NAME already uses $desired_ip"
+    fi
   fi
 }
 
 ensure_http_forwarding_rule() {
+  local desired_ip current_ip
+  desired_ip="$(get_lb_ip)"
+
   if ! resource_exists gcloud compute forwarding-rules describe "$HTTP_FWD_RULE_NAME" \
     --project="$PROJECT_ID" \
     --region="$REGION"; then
@@ -793,7 +821,29 @@ ensure_http_forwarding_rule() {
       --ports=80 \
       --network-tier=STANDARD
   else
-    log "HTTP forwarding rule $HTTP_FWD_RULE_NAME already exists"
+    current_ip="$(gcloud compute forwarding-rules describe "$HTTP_FWD_RULE_NAME" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --format='value(IPAddress)')"
+    if [[ "$current_ip" != "$desired_ip" ]]; then
+      warn "HTTP forwarding rule $HTTP_FWD_RULE_NAME uses $current_ip; recreating it on $desired_ip"
+      run gcloud compute forwarding-rules delete "$HTTP_FWD_RULE_NAME" \
+        --project="$PROJECT_ID" \
+        --region="$REGION" \
+        --quiet
+      run gcloud compute forwarding-rules create "$HTTP_FWD_RULE_NAME" \
+        --project="$PROJECT_ID" \
+        --region="$REGION" \
+        --load-balancing-scheme=EXTERNAL_MANAGED \
+        --network="$LB_NETWORK" \
+        --address="$ADDRESS_NAME" \
+        --target-http-proxy="$HTTP_PROXY_NAME" \
+        --target-http-proxy-region="$REGION" \
+        --ports=80 \
+        --network-tier=STANDARD
+    else
+      log "HTTP forwarding rule $HTTP_FWD_RULE_NAME already uses $desired_ip"
+    fi
   fi
 }
 

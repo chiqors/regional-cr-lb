@@ -26,6 +26,8 @@ Step 3 removes the shared load balancer resources and optionally also removes th
 
 One IP is shared across multiple hostnames. Routing happens by hostname, not by separate IPs.
 
+If you deploy multiple independent LBs in the same project and region, set a different `LB_NAME_PREFIX` for each deployment. The default resource names are shared, so omitting this would make later runs reuse the earlier LB's URL maps, proxies, and forwarding-rule names.
+
 ## Inputs
 
 ### Common
@@ -39,6 +41,7 @@ One IP is shared across multiple hostnames. Routing happens by hostname, not by 
 - `SERVICE_MAPPINGS`
 - `WILDCARD_DOMAIN` (optional; use one certificate for `*.example.com` instead of one per hostname)
 - `ENABLE_HTTPS` (optional; defaults to `true`; set to `false` for an HTTP-only frontend on port 80)
+- `LB_NAME_PREFIX` (optional; use a unique value when deploying more than one LB in the same project and region)
 
 ### Optional Cloudflare DNS Automation
 
