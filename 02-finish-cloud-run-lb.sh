@@ -5,11 +5,13 @@ PROJECT_ID="${PROJECT_ID:-}"
 REGION="${REGION:-}"
 SERVICE_MAPPINGS="${SERVICE_MAPPINGS:-}"
 
+LB_SCOPE="${LB_SCOPE:-regional}"
+
 LB_NETWORK="${LB_NETWORK:-lb-network}"
 PROXY_SUBNET="${PROXY_SUBNET:-lb-proxy-subnet}"
 PROXY_SUBNET_CIDR="${PROXY_SUBNET_CIDR:-10.129.0.0/23}"
 
-LB_NAME_PREFIX="${LB_NAME_PREFIX:-regional-serverless-lb}"
+LB_NAME_PREFIX="${LB_NAME_PREFIX:-cloud-run-lb}"
 ADDRESS_NAME="${ADDRESS_NAME:-}"
 URL_MAP_NAME="${URL_MAP_NAME:-${LB_NAME_PREFIX}-url-map}"
 REDIRECT_URL_MAP_NAME="${REDIRECT_URL_MAP_NAME:-${LB_NAME_PREFIX}-redirect-url-map}"
@@ -24,6 +26,11 @@ CERT_POLL_SECONDS="${CERT_POLL_SECONDS:-30}"
 SKIP_CERT_ATTACH="${SKIP_CERT_ATTACH:-false}"
 WILDCARD_DOMAIN="${WILDCARD_DOMAIN:-}"
 ENABLE_HTTPS="${ENABLE_HTTPS:-true}"
+
+CERT_MODE="${CERT_MODE:-managed}"
+CLASSIC_CERT_NAME="${CLASSIC_CERT_NAME:-${LB_NAME_PREFIX}-classic-cert}"
+
+NETWORK_TIER="${NETWORK_TIER:-}"
 
 CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
@@ -111,6 +118,53 @@ short_name() {
   printf '%s-%s-%s' "$prefix" "$slug" "$suffix"
 }
 
+lb_is_global() {
+  [[ "$(printf '%s' "$LB_SCOPE" | tr '[:upper:]' '[:lower:]')" == "global" ]]
+}
+
+cert_mode_is_classic_managed() {
+  [[ "$(printf '%s' "$CERT_MODE" | tr '[:upper:]' '[:lower:]')" == "classic-managed" ]]
+}
+
+cert_location() {
+  if lb_is_global; then
+    printf 'global'
+  else
+    printf '%s' "$REGION"
+  fi
+}
+
+validate_config() {
+  local scope mode
+  scope="$(printf '%s' "$LB_SCOPE" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$scope" != "regional" && "$scope" != "global" ]]; then
+    echo "LB_SCOPE must be 'regional' or 'global' (got '$LB_SCOPE')." >&2
+    exit 1
+  fi
+
+  mode="$(printf '%s' "$CERT_MODE" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$mode" != "managed" && "$mode" != "classic-managed" ]]; then
+    echo "CERT_MODE must be 'managed' or 'classic-managed' (got '$CERT_MODE')." >&2
+    exit 1
+  fi
+  if cert_mode_is_classic_managed && ! lb_is_global; then
+    echo "CERT_MODE=classic-managed requires LB_SCOPE=global (Google-managed classic SSL certs are global-only)." >&2
+    exit 1
+  fi
+
+  if [[ -z "$NETWORK_TIER" ]]; then
+    if lb_is_global; then
+      NETWORK_TIER="PREMIUM"
+    else
+      NETWORK_TIER="STANDARD"
+    fi
+  fi
+  if lb_is_global && [[ "$NETWORK_TIER" != "PREMIUM" ]]; then
+    echo "Global load balancer requires NETWORK_TIER=PREMIUM (got '$NETWORK_TIER')." >&2
+    exit 1
+  fi
+}
+
 parse_mappings() {
   local raw host service slug neg_name backend_name cert_name auth_name label
 
@@ -170,7 +224,7 @@ parse_mappings() {
     HOST_SLUGS+=("$slug")
     NEG_NAMES+=("$neg_name")
     BACKEND_NAMES+=("$backend_name")
-    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+    if ! cert_mode_is_classic_managed && [[ -z "$WILDCARD_DOMAIN" ]]; then
       CERT_NAMES+=("$cert_name")
       DNS_AUTH_NAMES+=("$auth_name")
     fi
@@ -181,7 +235,9 @@ parse_mappings() {
     exit 1
   fi
 
-  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+  if cert_mode_is_classic_managed; then
+    CERT_NAMES+=("$CLASSIC_CERT_NAME")
+  elif [[ -n "$WILDCARD_DOMAIN" ]]; then
     slug="$(slugify "$WILDCARD_DOMAIN")"
     CERT_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "wildcard-cert")")
     DNS_AUTH_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "wildcard-dns-auth")")
@@ -192,7 +248,7 @@ get_cert_scope() {
   local cert_name="$1"
   gcloud certificate-manager certificates describe "$cert_name" \
     --project="$PROJECT_ID" \
-    --location="$REGION" \
+    --location="$(cert_location)" \
     --format='value(scope)' 2>/dev/null || true
 }
 
@@ -200,22 +256,36 @@ get_cert_state() {
   local cert_name="$1"
   gcloud certificate-manager certificates describe "$cert_name" \
     --project="$PROJECT_ID" \
-    --location="$REGION" \
+    --location="$(cert_location)" \
     --format='value(managed.state)' 2>/dev/null || true
 }
 
-get_lb_ip() {
-  gcloud compute addresses describe "$ADDRESS_NAME" \
+get_classic_cert_status() {
+  gcloud compute ssl-certificates describe "$CLASSIC_CERT_NAME" \
     --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format='value(address)'
+    --global \
+    --format='value(managed.status)' 2>/dev/null || true
+}
+
+get_lb_ip() {
+  if lb_is_global; then
+    gcloud compute addresses describe "$ADDRESS_NAME" \
+      --project="$PROJECT_ID" \
+      --global \
+      --format='value(address)'
+  else
+    gcloud compute addresses describe "$ADDRESS_NAME" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --format='value(address)'
+  fi
 }
 
 get_dns_auth_record_name() {
   local auth_name="$1"
   gcloud certificate-manager dns-authorizations describe "$auth_name" \
     --project="$PROJECT_ID" \
-    --location="$REGION" \
+    --location="$(cert_location)" \
     --format='value(dnsResourceRecord.name)'
 }
 
@@ -223,7 +293,7 @@ get_dns_auth_record_data() {
   local auth_name="$1"
   gcloud certificate-manager dns-authorizations describe "$auth_name" \
     --project="$PROJECT_ID" \
-    --location="$REGION" \
+    --location="$(cert_location)" \
     --format='value(dnsResourceRecord.data)'
 }
 
@@ -369,7 +439,7 @@ ensure_cloudflare_dns_record() {
     exit 1
   fi
 
-  payload="$(printf '{"type":"%s","name":"%s","content":"%s","ttl":%s,"proxied":%s,"comment":"Managed by regional-cloud-run-lb"}' \
+  payload="$(printf '{"type":"%s","name":"%s","content":"%s","ttl":%s,"proxied":%s,"comment":"Managed by cloud-run-lb"}' \
     "$type" "$name" "$content" "$CLOUDFLARE_TTL" "$proxied")"
 
   if [[ -z "$record_id" ]]; then
@@ -415,7 +485,7 @@ ensure_project() {
   run gcloud services enable \
     run.googleapis.com \
     compute.googleapis.com
-  if bool_is_true "$ENABLE_HTTPS"; then
+  if bool_is_true "$ENABLE_HTTPS" && ! cert_mode_is_classic_managed; then
     run gcloud services enable certificatemanager.googleapis.com
   fi
 }
@@ -428,6 +498,9 @@ ensure_cloud_run_services() {
 }
 
 ensure_network() {
+  if lb_is_global; then
+    return 0
+  fi
   if ! resource_exists gcloud compute networks describe "$LB_NETWORK" --project="$PROJECT_ID"; then
     run gcloud compute networks create "$LB_NETWORK" \
       --project="$PROJECT_ID" \
@@ -438,6 +511,9 @@ ensure_network() {
 }
 
 ensure_proxy_subnet() {
+  if lb_is_global; then
+    return 0
+  fi
   if ! resource_exists gcloud compute networks subnets describe "$PROXY_SUBNET" \
     --project="$PROJECT_ID" \
     --region="$REGION"; then
@@ -454,12 +530,20 @@ ensure_proxy_subnet() {
 }
 
 ensure_address_exists() {
-  if ! resource_exists gcloud compute addresses describe "$ADDRESS_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$REGION"; then
-    echo "Static IP $ADDRESS_NAME does not exist in region $REGION." >&2
-    echo "Run ./01-create-ip-and-show-dns.sh first." >&2
-    exit 1
+  if lb_is_global; then
+    if ! resource_exists gcloud compute addresses describe "$ADDRESS_NAME" \
+      --project="$PROJECT_ID" --global; then
+      echo "Global IP $ADDRESS_NAME does not exist." >&2
+      echo "Run ./01-create-ip-and-show-dns.sh with LB_SCOPE=global first." >&2
+      exit 1
+    fi
+  else
+    if ! resource_exists gcloud compute addresses describe "$ADDRESS_NAME" \
+      --project="$PROJECT_ID" --region="$REGION"; then
+      echo "Regional IP $ADDRESS_NAME does not exist in region $REGION." >&2
+      echo "Run ./01-create-ip-and-show-dns.sh first." >&2
+      exit 1
+    fi
   fi
 }
 
@@ -484,29 +568,59 @@ ensure_backend_service() {
   local backend_name="$1"
   local neg_name="$2"
 
-  if ! resource_exists gcloud compute backend-services describe "$backend_name" \
-    --project="$PROJECT_ID" \
-    --region="$REGION"; then
-    run gcloud compute backend-services create "$backend_name" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --load-balancing-scheme=EXTERNAL_MANAGED \
-      --protocol=HTTP
+  if lb_is_global; then
+    if ! resource_exists gcloud compute backend-services describe "$backend_name" \
+      --project="$PROJECT_ID" --global; then
+      run gcloud compute backend-services create "$backend_name" \
+        --project="$PROJECT_ID" \
+        --global \
+        --load-balancing-scheme=EXTERNAL_MANAGED \
+        --protocol=HTTP
+    else
+      log "Backend service $backend_name already exists"
+    fi
+    if ! gcloud compute backend-services describe "$backend_name" \
+        --project="$PROJECT_ID" --global --format='json' \
+        | grep -q "\"group\": \".*/networkEndpointGroups/${neg_name}\""; then
+      run gcloud compute backend-services add-backend "$backend_name" \
+        --project="$PROJECT_ID" \
+        --global \
+        --network-endpoint-group="$neg_name" \
+        --network-endpoint-group-region="$REGION"
+    else
+      log "Backend service $backend_name already points at NEG $neg_name"
+    fi
   else
-    log "Backend service $backend_name already exists"
+    if ! resource_exists gcloud compute backend-services describe "$backend_name" \
+      --project="$PROJECT_ID" --region="$REGION"; then
+      run gcloud compute backend-services create "$backend_name" \
+        --project="$PROJECT_ID" \
+        --region="$REGION" \
+        --load-balancing-scheme=EXTERNAL_MANAGED \
+        --protocol=HTTP
+    else
+      log "Backend service $backend_name already exists"
+    fi
+    if ! gcloud compute backend-services describe "$backend_name" \
+        --project="$PROJECT_ID" --region="$REGION" --format='json' \
+        | grep -q "\"group\": \".*/networkEndpointGroups/${neg_name}\""; then
+      run gcloud compute backend-services add-backend "$backend_name" \
+        --project="$PROJECT_ID" \
+        --region="$REGION" \
+        --network-endpoint-group="$neg_name" \
+        --network-endpoint-group-region="$REGION"
+    else
+      log "Backend service $backend_name already points at NEG $neg_name"
+    fi
   fi
+}
 
-  if ! gcloud compute backend-services describe "$backend_name" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --format='json' | grep -q "\"group\": \".*/networkEndpointGroups/${neg_name}\""; then
-    run gcloud compute backend-services add-backend "$backend_name" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --network-endpoint-group="$neg_name" \
-      --network-endpoint-group-region="$REGION"
+backend_path() {
+  local name="$1"
+  if lb_is_global; then
+    printf 'global/backendServices/%s' "$name"
   else
-    log "Backend service $backend_name already points at NEG $neg_name"
+    printf 'regions/%s/backendServices/%s' "$REGION" "$name"
   fi
 }
 
@@ -517,7 +631,7 @@ render_main_url_map() {
 
   {
     echo "name: ${URL_MAP_NAME}"
-    echo "defaultService: regions/${REGION}/backendServices/${default_backend}"
+    echo "defaultService: $(backend_path "$default_backend")"
     echo "hostRules:"
     for i in "${!HOSTS[@]}"; do
       cat <<EOF
@@ -530,7 +644,7 @@ EOF
     for i in "${!HOSTS[@]}"; do
       cat <<EOF
 - name: matcher-${HOST_SLUGS[$i]}
-  defaultService: regions/${REGION}/backendServices/${BACKEND_NAMES[$i]}
+  defaultService: $(backend_path "${BACKEND_NAMES[$i]}")
 EOF
     done
     echo "tests:"
@@ -538,7 +652,7 @@ EOF
       cat <<EOF
 - host: ${HOSTS[$i]}
   path: /
-  service: regions/${REGION}/backendServices/${BACKEND_NAMES[$i]}
+  service: $(backend_path "${BACKEND_NAMES[$i]}")
 EOF
     done
   } >"$file"
@@ -558,24 +672,27 @@ EOF
 }
 
 ensure_url_maps() {
-  local main_map_file
+  local main_map_file redirect_map_file
 
   main_map_file="$(render_main_url_map)"
 
-  run gcloud compute url-maps import "$URL_MAP_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --source="$main_map_file" \
-    --quiet
+  if lb_is_global; then
+    run gcloud compute url-maps import "$URL_MAP_NAME" \
+      --project="$PROJECT_ID" --global --source="$main_map_file" --quiet
+  else
+    run gcloud compute url-maps import "$URL_MAP_NAME" \
+      --project="$PROJECT_ID" --region="$REGION" --source="$main_map_file" --quiet
+  fi
 
   if bool_is_true "$ENABLE_HTTPS"; then
-    local redirect_map_file
     redirect_map_file="$(render_redirect_url_map)"
-    run gcloud compute url-maps import "$REDIRECT_URL_MAP_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --source="$redirect_map_file" \
-      --quiet
+    if lb_is_global; then
+      run gcloud compute url-maps import "$REDIRECT_URL_MAP_NAME" \
+        --project="$PROJECT_ID" --global --source="$redirect_map_file" --quiet
+    else
+      run gcloud compute url-maps import "$REDIRECT_URL_MAP_NAME" \
+        --project="$PROJECT_ID" --region="$REGION" --source="$redirect_map_file" --quiet
+    fi
   fi
 }
 
@@ -585,10 +702,10 @@ ensure_dns_authorization() {
 
   if ! resource_exists gcloud certificate-manager dns-authorizations describe "$auth_name" \
     --project="$PROJECT_ID" \
-    --location="$REGION"; then
+    --location="$(cert_location)"; then
     run gcloud certificate-manager dns-authorizations create "$auth_name" \
       --project="$PROJECT_ID" \
-      --location="$REGION" \
+      --location="$(cert_location)" \
       --domain="$domain"
   else
     log "DNS authorization $auth_name already exists"
@@ -600,7 +717,7 @@ print_dns_authorization_records() {
 
   gcloud certificate-manager dns-authorizations describe "$auth_name" \
     --project="$PROJECT_ID" \
-    --location="$REGION" \
+    --location="$(cert_location)" \
     --format='yaml(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)'
 }
 
@@ -618,11 +735,15 @@ EOF
     printf '%s. %s -> %s\n' "$((i + 1))" "${HOSTS[$i]}" "$ip"
   done
 
-  printf '\nCertificate Manager CNAME records:\n'
-  for i in "${!DNS_AUTH_NAMES[@]}"; do
-    printf '\n[%s]\n' "${WILDCARD_DOMAIN:-${HOSTS[$i]}}"
-    print_dns_authorization_records "${DNS_AUTH_NAMES[$i]}"
-  done
+  if cert_mode_is_classic_managed; then
+    printf '\nClassic managed cert will be issued automatically once DNS resolves to %s.\n' "$ip"
+  else
+    printf '\nCertificate Manager CNAME records:\n'
+    for i in "${!DNS_AUTH_NAMES[@]}"; do
+      printf '\n[%s]\n' "${WILDCARD_DOMAIN:-${HOSTS[$i]}}"
+      print_dns_authorization_records "${DNS_AUTH_NAMES[$i]}"
+    done
+  fi
   printf '\nAdd or verify these records now; this process will continue polling.\n\n'
 }
 
@@ -634,16 +755,16 @@ ensure_certificate() {
 
   existing_scope="$(get_cert_scope "$cert_name")"
   if [[ -n "$existing_scope" && "$existing_scope" != "DEFAULT" ]]; then
-    echo "Existing certificate $cert_name has scope '$existing_scope'. Regional ALB requires scope 'DEFAULT'." >&2
+    echo "Existing certificate $cert_name has scope '$existing_scope'. Expected scope 'DEFAULT'." >&2
     exit 1
   fi
 
   if ! resource_exists gcloud certificate-manager certificates describe "$cert_name" \
     --project="$PROJECT_ID" \
-    --location="$REGION"; then
+    --location="$(cert_location)"; then
     run gcloud certificate-manager certificates create "$cert_name" \
       --project="$PROJECT_ID" \
-      --location="$REGION" \
+      --location="$(cert_location)" \
       --domains="$domain" \
       --dns-authorizations="$auth_name"
   else
@@ -651,7 +772,22 @@ ensure_certificate() {
   fi
 }
 
-all_certificates_active() {
+ensure_classic_managed_certificate() {
+  local domains
+  domains="$(join_by_comma "${HOSTS[@]}")"
+
+  if resource_exists gcloud compute ssl-certificates describe "$CLASSIC_CERT_NAME" \
+    --project="$PROJECT_ID" --global; then
+    log "Classic managed SSL cert $CLASSIC_CERT_NAME already exists (delete it manually to change domains)"
+    return 0
+  fi
+  run gcloud compute ssl-certificates create "$CLASSIC_CERT_NAME" \
+    --project="$PROJECT_ID" \
+    --global \
+    --domains="$domains"
+}
+
+all_managed_certificates_active() {
   local cert_name state
   for cert_name in "${CERT_NAMES[@]}"; do
     state="$(get_cert_state "$cert_name")"
@@ -662,11 +798,17 @@ all_certificates_active() {
   return 0
 }
 
-wait_for_active_certificates_if_requested() {
+classic_managed_certificate_active() {
+  local status
+  status="$(get_classic_cert_status)"
+  [[ "$status" == "ACTIVE" ]]
+}
+
+wait_for_active_managed_certificates_if_requested() {
   local waited=0
   local cert_name state
 
-  if all_certificates_active; then
+  if all_managed_certificates_active; then
     log "All certificates are ACTIVE"
     return 0
   fi
@@ -691,7 +833,7 @@ wait_for_active_certificates_if_requested() {
   while (( waited < CERT_WAIT_TIMEOUT_SECONDS )); do
     sleep "$CERT_POLL_SECONDS"
     waited=$((waited + CERT_POLL_SECONDS))
-    if all_certificates_active; then
+    if all_managed_certificates_active; then
       log "All certificates are ACTIVE"
       return 0
     fi
@@ -702,6 +844,38 @@ wait_for_active_certificates_if_requested() {
   done
 
   warn "Timed out waiting for certificate activation after ${CERT_WAIT_TIMEOUT_SECONDS}s."
+  return 2
+}
+
+wait_for_classic_managed_cert_if_requested() {
+  local waited=0 status
+
+  if classic_managed_certificate_active; then
+    log "Classic managed cert $CLASSIC_CERT_NAME is ACTIVE"
+    return 0
+  fi
+
+  if ! bool_is_true "$WAIT_FOR_CERT"; then
+    status="$(get_classic_cert_status)"
+    warn "Classic managed cert $CLASSIC_CERT_NAME status: ${status:-UNKNOWN}"
+    warn "Google issues the cert once DNS points at the LB IP; rerun or wait."
+    return 1
+  fi
+
+  print_dns_setup_instructions
+  log "Waiting for classic managed cert $CLASSIC_CERT_NAME to become ACTIVE"
+  while (( waited < CERT_WAIT_TIMEOUT_SECONDS )); do
+    sleep "$CERT_POLL_SECONDS"
+    waited=$((waited + CERT_POLL_SECONDS))
+    if classic_managed_certificate_active; then
+      log "Classic managed cert is ACTIVE"
+      return 0
+    fi
+    status="$(get_classic_cert_status)"
+    log "Classic cert status: ${status:-UNKNOWN} (${waited}s elapsed)"
+  done
+
+  warn "Timed out waiting for classic managed cert activation after ${CERT_WAIT_TIMEOUT_SECONDS}s."
   return 2
 }
 
@@ -718,23 +892,40 @@ join_by_comma() {
 }
 
 ensure_https_proxy() {
-  local cert_list
+  local cert_list cert_flag
   cert_list="$(join_by_comma "${CERT_NAMES[@]}")"
-
-  if ! resource_exists gcloud compute target-https-proxies describe "$HTTPS_PROXY_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$REGION"; then
-    run gcloud compute target-https-proxies create "$HTTPS_PROXY_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --url-map="$URL_MAP_NAME" \
-      --certificate-manager-certificates="$cert_list"
+  if cert_mode_is_classic_managed; then
+    cert_flag="--ssl-certificates=$cert_list"
   else
-    run gcloud compute target-https-proxies update "$HTTPS_PROXY_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --url-map="$URL_MAP_NAME" \
-      --certificate-manager-certificates="$cert_list"
+    cert_flag="--certificate-manager-certificates=$cert_list"
+  fi
+
+  if lb_is_global; then
+    if ! resource_exists gcloud compute target-https-proxies describe "$HTTPS_PROXY_NAME" \
+      --project="$PROJECT_ID" --global; then
+      run gcloud compute target-https-proxies create "$HTTPS_PROXY_NAME" \
+        --project="$PROJECT_ID" --global \
+        --url-map="$URL_MAP_NAME" \
+        "$cert_flag"
+    else
+      run gcloud compute target-https-proxies update "$HTTPS_PROXY_NAME" \
+        --project="$PROJECT_ID" --global \
+        --url-map="$URL_MAP_NAME" \
+        "$cert_flag"
+    fi
+  else
+    if ! resource_exists gcloud compute target-https-proxies describe "$HTTPS_PROXY_NAME" \
+      --project="$PROJECT_ID" --region="$REGION"; then
+      run gcloud compute target-https-proxies create "$HTTPS_PROXY_NAME" \
+        --project="$PROJECT_ID" --region="$REGION" \
+        --url-map="$URL_MAP_NAME" \
+        "$cert_flag"
+    else
+      run gcloud compute target-https-proxies update "$HTTPS_PROXY_NAME" \
+        --project="$PROJECT_ID" --region="$REGION" \
+        --url-map="$URL_MAP_NAME" \
+        "$cert_flag"
+    fi
   fi
 }
 
@@ -744,119 +935,101 @@ ensure_http_proxy() {
     proxy_url_map="$URL_MAP_NAME"
   fi
 
-  if ! resource_exists gcloud compute target-http-proxies describe "$HTTP_PROXY_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$REGION"; then
-    run gcloud compute target-http-proxies create "$HTTP_PROXY_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --url-map="$proxy_url_map"
+  if lb_is_global; then
+    if ! resource_exists gcloud compute target-http-proxies describe "$HTTP_PROXY_NAME" \
+      --project="$PROJECT_ID" --global; then
+      run gcloud compute target-http-proxies create "$HTTP_PROXY_NAME" \
+        --project="$PROJECT_ID" --global --url-map="$proxy_url_map"
+    else
+      run gcloud compute target-http-proxies update "$HTTP_PROXY_NAME" \
+        --project="$PROJECT_ID" --global --url-map="$proxy_url_map"
+    fi
   else
-    run gcloud compute target-http-proxies update "$HTTP_PROXY_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --url-map="$proxy_url_map"
+    if ! resource_exists gcloud compute target-http-proxies describe "$HTTP_PROXY_NAME" \
+      --project="$PROJECT_ID" --region="$REGION"; then
+      run gcloud compute target-http-proxies create "$HTTP_PROXY_NAME" \
+        --project="$PROJECT_ID" --region="$REGION" --url-map="$proxy_url_map"
+    else
+      run gcloud compute target-http-proxies update "$HTTP_PROXY_NAME" \
+        --project="$PROJECT_ID" --region="$REGION" --url-map="$proxy_url_map"
+    fi
+  fi
+}
+
+create_forwarding_rule() {
+  local name="$1" port="$2" target_flag="$3" target_name="$4"
+
+  if lb_is_global; then
+    run gcloud compute forwarding-rules create "$name" \
+      --project="$PROJECT_ID" --global \
+      --load-balancing-scheme=EXTERNAL_MANAGED \
+      --address="$ADDRESS_NAME" \
+      "$target_flag=$target_name" \
+      --ports="$port" \
+      --network-tier="$NETWORK_TIER"
+  else
+    run gcloud compute forwarding-rules create "$name" \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --load-balancing-scheme=EXTERNAL_MANAGED \
+      --network="$LB_NETWORK" \
+      --address="$ADDRESS_NAME" \
+      "$target_flag=$target_name" \
+      "${target_flag}-region=$REGION" \
+      --ports="$port" \
+      --network-tier="$NETWORK_TIER"
+  fi
+}
+
+ensure_forwarding_rule() {
+  local name="$1" port="$2" target_flag="$3" target_name="$4"
+  local desired_ip current_ip exists_flags
+  desired_ip="$(get_lb_ip)"
+
+  if lb_is_global; then
+    exists_flags=(--project="$PROJECT_ID" --global)
+  else
+    exists_flags=(--project="$PROJECT_ID" --region="$REGION")
+  fi
+
+  if ! resource_exists gcloud compute forwarding-rules describe "$name" "${exists_flags[@]}"; then
+    create_forwarding_rule "$name" "$port" "$target_flag" "$target_name"
+    return 0
+  fi
+
+  current_ip="$(gcloud compute forwarding-rules describe "$name" "${exists_flags[@]}" --format='value(IPAddress)')"
+  if [[ "$current_ip" != "$desired_ip" ]]; then
+    warn "Forwarding rule $name uses $current_ip; recreating it on $desired_ip"
+    run gcloud compute forwarding-rules delete "$name" "${exists_flags[@]}" --quiet
+    create_forwarding_rule "$name" "$port" "$target_flag" "$target_name"
+  else
+    log "Forwarding rule $name already uses $desired_ip"
   fi
 }
 
 ensure_https_forwarding_rule() {
-  local desired_ip current_ip
-  desired_ip="$(get_lb_ip)"
-
-  if ! resource_exists gcloud compute forwarding-rules describe "$HTTPS_FWD_RULE_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$REGION"; then
-    run gcloud compute forwarding-rules create "$HTTPS_FWD_RULE_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --load-balancing-scheme=EXTERNAL_MANAGED \
-      --network="$LB_NETWORK" \
-      --address="$ADDRESS_NAME" \
-      --target-https-proxy="$HTTPS_PROXY_NAME" \
-      --target-https-proxy-region="$REGION" \
-      --ports=443 \
-      --network-tier=STANDARD
-  else
-    current_ip="$(gcloud compute forwarding-rules describe "$HTTPS_FWD_RULE_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --format='value(IPAddress)')"
-    if [[ "$current_ip" != "$desired_ip" ]]; then
-      warn "HTTPS forwarding rule $HTTPS_FWD_RULE_NAME uses $current_ip; recreating it on $desired_ip"
-      run gcloud compute forwarding-rules delete "$HTTPS_FWD_RULE_NAME" \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --quiet
-      run gcloud compute forwarding-rules create "$HTTPS_FWD_RULE_NAME" \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --load-balancing-scheme=EXTERNAL_MANAGED \
-        --network="$LB_NETWORK" \
-        --address="$ADDRESS_NAME" \
-        --target-https-proxy="$HTTPS_PROXY_NAME" \
-        --target-https-proxy-region="$REGION" \
-        --ports=443 \
-        --network-tier=STANDARD
-    else
-      log "HTTPS forwarding rule $HTTPS_FWD_RULE_NAME already uses $desired_ip"
-    fi
-  fi
+  ensure_forwarding_rule "$HTTPS_FWD_RULE_NAME" 443 "--target-https-proxy" "$HTTPS_PROXY_NAME"
 }
 
 ensure_http_forwarding_rule() {
-  local desired_ip current_ip
-  desired_ip="$(get_lb_ip)"
-
-  if ! resource_exists gcloud compute forwarding-rules describe "$HTTP_FWD_RULE_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$REGION"; then
-    run gcloud compute forwarding-rules create "$HTTP_FWD_RULE_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --load-balancing-scheme=EXTERNAL_MANAGED \
-      --network="$LB_NETWORK" \
-      --address="$ADDRESS_NAME" \
-      --target-http-proxy="$HTTP_PROXY_NAME" \
-      --target-http-proxy-region="$REGION" \
-      --ports=80 \
-      --network-tier=STANDARD
-  else
-    current_ip="$(gcloud compute forwarding-rules describe "$HTTP_FWD_RULE_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --format='value(IPAddress)')"
-    if [[ "$current_ip" != "$desired_ip" ]]; then
-      warn "HTTP forwarding rule $HTTP_FWD_RULE_NAME uses $current_ip; recreating it on $desired_ip"
-      run gcloud compute forwarding-rules delete "$HTTP_FWD_RULE_NAME" \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --quiet
-      run gcloud compute forwarding-rules create "$HTTP_FWD_RULE_NAME" \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --load-balancing-scheme=EXTERNAL_MANAGED \
-        --network="$LB_NETWORK" \
-        --address="$ADDRESS_NAME" \
-        --target-http-proxy="$HTTP_PROXY_NAME" \
-        --target-http-proxy-region="$REGION" \
-        --ports=80 \
-        --network-tier=STANDARD
-    else
-      log "HTTP forwarding rule $HTTP_FWD_RULE_NAME already uses $desired_ip"
-    fi
-  fi
+  ensure_forwarding_rule "$HTTP_FWD_RULE_NAME" 80 "--target-http-proxy" "$HTTP_PROXY_NAME"
 }
 
 print_summary() {
-  local ip cert_name state i
+  local ip cert_name state i scope_label
   ip="$(get_lb_ip)"
+  if lb_is_global; then
+    scope_label="Global"
+  else
+    scope_label="Regional ($REGION)"
+  fi
 
   cat <<EOF
 
-Regional load balancer summary
-------------------------------
+Load balancer summary
+---------------------
+Scope:            $scope_label
 Project:          $PROJECT_ID
-Region:           $REGION
+Cloud Run region: $REGION
 Load balancer IP: $ip
 Cloudflare DNS:   $(cloudflare_dns_enabled && printf 'enabled' || printf 'manual')
 Mappings:
@@ -875,17 +1048,23 @@ EOF
   done
 
   if bool_is_true "$ENABLE_HTTPS"; then
-    printf '\nCertificate states:\n'
-    for cert_name in "${CERT_NAMES[@]}"; do
-      state="$(get_cert_state "$cert_name")"
-      printf -- '- %s: %s\n' "$cert_name" "${state:-UNKNOWN}"
-    done
+    if cert_mode_is_classic_managed; then
+      state="$(get_classic_cert_status)"
+      printf '\nClassic managed SSL cert: %s -> %s\n' "$CLASSIC_CERT_NAME" "${state:-UNKNOWN}"
+      printf 'Domains: %s\n' "$(join_by_comma "${HOSTS[@]}")"
+    else
+      printf '\nCertificate states:\n'
+      for cert_name in "${CERT_NAMES[@]}"; do
+        state="$(get_cert_state "$cert_name")"
+        printf -- '- %s: %s\n' "$cert_name" "${state:-UNKNOWN}"
+      done
 
-    printf '\nCertificate Manager DNS authorization records:\n'
-    for i in "${!DNS_AUTH_NAMES[@]}"; do
-      printf '\n[%s]\n' "${WILDCARD_DOMAIN:-${HOSTS[$i]}}"
-      print_dns_authorization_records "${DNS_AUTH_NAMES[$i]}"
-    done
+      printf '\nCertificate Manager DNS authorization records:\n'
+      for i in "${!DNS_AUTH_NAMES[@]}"; do
+        printf '\n[%s]\n' "${WILDCARD_DOMAIN:-${HOSTS[$i]}}"
+        print_dns_authorization_records "${DNS_AUTH_NAMES[$i]}"
+      done
+    fi
   else
     printf '\nFrontend: HTTP only (port 80)\n'
   fi
@@ -898,6 +1077,7 @@ main() {
   require_env SERVICE_MAPPINGS
   require_cmd gcloud
   require_cloudflare_cmds_if_enabled
+  validate_config
   parse_mappings
 
   ensure_project
@@ -909,32 +1089,39 @@ main() {
   local i wait_status
   local lb_ip
   lb_ip="$(get_lb_ip)"
+  local use_managed_cert=false
+  if bool_is_true "$ENABLE_HTTPS" && ! cert_mode_is_classic_managed; then
+    use_managed_cert=true
+  fi
+
   for i in "${!HOSTS[@]}"; do
     ensure_serverless_neg "${NEG_NAMES[$i]}" "${SERVICES[$i]}"
     ensure_backend_service "${BACKEND_NAMES[$i]}" "${NEG_NAMES[$i]}"
-    if bool_is_true "$ENABLE_HTTPS" && [[ -z "$WILDCARD_DOMAIN" ]]; then
+    if $use_managed_cert && [[ -z "$WILDCARD_DOMAIN" ]]; then
       ensure_dns_authorization "${DNS_AUTH_NAMES[$i]}" "${HOSTS[$i]}"
     fi
     if cloudflare_dns_enabled; then
-      if [[ -n "$WILDCARD_DOMAIN" ]]; then
-        ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" ""
-      elif bool_is_true "$ENABLE_HTTPS"; then
+      if $use_managed_cert && [[ -z "$WILDCARD_DOMAIN" ]]; then
         ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" "${DNS_AUTH_NAMES[$i]}"
       else
         ensure_cloudflare_dns_records "$lb_ip" "${HOSTS[$i]}" ""
       fi
     fi
-    if bool_is_true "$ENABLE_HTTPS" && [[ -z "$WILDCARD_DOMAIN" ]]; then
+    if $use_managed_cert && [[ -z "$WILDCARD_DOMAIN" ]]; then
       ensure_certificate "${CERT_NAMES[$i]}" "${DNS_AUTH_NAMES[$i]}" "${HOSTS[$i]}"
     fi
   done
 
-  if bool_is_true "$ENABLE_HTTPS" && [[ -n "$WILDCARD_DOMAIN" ]]; then
+  if $use_managed_cert && [[ -n "$WILDCARD_DOMAIN" ]]; then
     ensure_dns_authorization "${DNS_AUTH_NAMES[0]}" "$WILDCARD_DOMAIN"
     if cloudflare_dns_enabled; then
       ensure_cloudflare_dns_authorization_record "${DNS_AUTH_NAMES[0]}" "$WILDCARD_DOMAIN"
     fi
     ensure_certificate "${CERT_NAMES[0]}" "${DNS_AUTH_NAMES[0]}" "*.$WILDCARD_DOMAIN"
+  fi
+
+  if bool_is_true "$ENABLE_HTTPS" && cert_mode_is_classic_managed; then
+    ensure_classic_managed_certificate
   fi
 
   ensure_url_maps
@@ -943,7 +1130,13 @@ main() {
     log "ENABLE_HTTPS=false: configuring HTTP only on port 80"
     ensure_http_proxy
     ensure_http_forwarding_rule
-  elif wait_for_active_certificates_if_requested; then
+  elif cert_mode_is_classic_managed; then
+    ensure_https_proxy
+    ensure_http_proxy
+    ensure_https_forwarding_rule
+    ensure_http_forwarding_rule
+    wait_for_classic_managed_cert_if_requested || true
+  elif wait_for_active_managed_certificates_if_requested; then
     ensure_https_proxy
     ensure_http_proxy
     ensure_https_forwarding_rule

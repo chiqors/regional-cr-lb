@@ -6,10 +6,12 @@ REGION="${REGION:-}"
 
 SERVICE_MAPPINGS="${SERVICE_MAPPINGS:-}"
 
+LB_SCOPE="${LB_SCOPE:-regional}"
+
 LB_NETWORK="${LB_NETWORK:-lb-network}"
 PROXY_SUBNET="${PROXY_SUBNET:-lb-proxy-subnet}"
 
-LB_NAME_PREFIX="${LB_NAME_PREFIX:-regional-serverless-lb}"
+LB_NAME_PREFIX="${LB_NAME_PREFIX:-cloud-run-lb}"
 ADDRESS_NAME="${ADDRESS_NAME:-}"
 URL_MAP_NAME="${URL_MAP_NAME:-${LB_NAME_PREFIX}-url-map}"
 REDIRECT_URL_MAP_NAME="${REDIRECT_URL_MAP_NAME:-${LB_NAME_PREFIX}-redirect-url-map}"
@@ -23,6 +25,9 @@ DELETE_ADDRESS="${DELETE_ADDRESS:-false}"
 DELETE_NETWORK="${DELETE_NETWORK:-false}"
 DELETE_CLOUDFLARE_DNS="${DELETE_CLOUDFLARE_DNS:-false}"
 WILDCARD_DOMAIN="${WILDCARD_DOMAIN:-}"
+
+CERT_MODE="${CERT_MODE:-managed}"
+CLASSIC_CERT_NAME="${CLASSIC_CERT_NAME:-${LB_NAME_PREFIX}-classic-cert}"
 
 CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
@@ -94,6 +99,36 @@ short_name() {
   printf '%s-%s-%s' "$prefix" "$slug" "$suffix"
 }
 
+lb_is_global() {
+  [[ "$(printf '%s' "$LB_SCOPE" | tr '[:upper:]' '[:lower:]')" == "global" ]]
+}
+
+cert_mode_is_classic_managed() {
+  [[ "$(printf '%s' "$CERT_MODE" | tr '[:upper:]' '[:lower:]')" == "classic-managed" ]]
+}
+
+cert_location() {
+  if lb_is_global; then
+    printf 'global'
+  else
+    printf '%s' "$REGION"
+  fi
+}
+
+validate_config() {
+  local scope mode
+  scope="$(printf '%s' "$LB_SCOPE" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$scope" != "regional" && "$scope" != "global" ]]; then
+    echo "LB_SCOPE must be 'regional' or 'global' (got '$LB_SCOPE')." >&2
+    exit 1
+  fi
+  mode="$(printf '%s' "$CERT_MODE" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$mode" != "managed" && "$mode" != "classic-managed" ]]; then
+    echo "CERT_MODE must be 'managed' or 'classic-managed' (got '$CERT_MODE')." >&2
+    exit 1
+  fi
+}
+
 cloudflare_dns_delete_enabled() {
   bool_is_true "$DELETE_CLOUDFLARE_DNS"
 }
@@ -101,14 +136,8 @@ cloudflare_dns_delete_enabled() {
 require_cloudflare_cmds_if_enabled() {
   if cloudflare_dns_delete_enabled; then
     require_env CLOUDFLARE_API_TOKEN
-    command -v curl >/dev/null 2>&1 || {
-      echo "Missing required command: curl" >&2
-      exit 1
-    }
-    command -v python3 >/dev/null 2>&1 || {
-      echo "Missing required command: python3" >&2
-      exit 1
-    }
+    command -v curl >/dev/null 2>&1 || { echo "Missing required command: curl" >&2; exit 1; }
+    command -v python3 >/dev/null 2>&1 || { echo "Missing required command: python3" >&2; exit 1; }
   fi
 }
 
@@ -145,10 +174,8 @@ get_cached_cloudflare_zone_id() {
 }
 
 cache_cloudflare_zone_id() {
-  local zone_name="$1"
-  local zone_id="$2"
-  CF_ZONE_CACHE_NAMES+=("$zone_name")
-  CF_ZONE_CACHE_IDS+=("$zone_id")
+  CF_ZONE_CACHE_NAMES+=("$1")
+  CF_ZONE_CACHE_IDS+=("$2")
 }
 
 get_first_result_id() {
@@ -237,7 +264,7 @@ get_dns_auth_record_name_if_present() {
   local auth_name="$1"
   gcloud certificate-manager dns-authorizations describe "$auth_name" \
     --project="$PROJECT_ID" \
-    --location="$REGION" \
+    --location="$(cert_location)" \
     --format='value(dnsResourceRecord.name)' 2>/dev/null || true
 }
 
@@ -289,13 +316,13 @@ parse_mappings() {
     HOSTS+=("$host")
     NEG_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "neg")")
     BACKEND_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "backend")")
-    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+    if ! cert_mode_is_classic_managed && [[ -z "$WILDCARD_DOMAIN" ]]; then
       CERT_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "cert")")
       DNS_AUTH_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "dns-auth")")
     fi
   done
 
-  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+  if ! cert_mode_is_classic_managed && [[ -n "$WILDCARD_DOMAIN" ]]; then
     slug="$(slugify "$WILDCARD_DOMAIN")"
     CERT_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "wildcard-cert")")
     DNS_AUTH_NAMES+=("$(short_name "$LB_NAME_PREFIX" "$slug" "wildcard-dns-auth")")
@@ -313,31 +340,56 @@ delete_if_exists() {
   fi
 }
 
+scope_flag() {
+  if lb_is_global; then
+    printf -- '--global'
+  else
+    printf -- "--region=%s" "$REGION"
+  fi
+}
+
+delete_backend_service() {
+  local name="$1"
+  if lb_is_global; then
+    delete_if_exists \
+      "gcloud compute backend-services describe '$name' --project='$PROJECT_ID' --global" \
+      gcloud compute backend-services delete "$name" --project="$PROJECT_ID" --global --quiet
+  else
+    delete_if_exists \
+      "gcloud compute backend-services describe '$name' --project='$PROJECT_ID' --region='$REGION'" \
+      gcloud compute backend-services delete "$name" --project="$PROJECT_ID" --region="$REGION" --quiet
+  fi
+}
+
 delete_mapping_resources() {
   local i
   for i in "${!HOSTS[@]}"; do
-    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+    if ! cert_mode_is_classic_managed && [[ -z "$WILDCARD_DOMAIN" ]]; then
       delete_certificate_resources "${CERT_NAMES[$i]}" "${DNS_AUTH_NAMES[$i]}"
     fi
 
-    delete_if_exists \
-      "gcloud compute backend-services describe '${BACKEND_NAMES[$i]}' --project='$PROJECT_ID' --region='$REGION'" \
-      gcloud compute backend-services delete "${BACKEND_NAMES[$i]}" \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --quiet
+    delete_backend_service "${BACKEND_NAMES[$i]}"
 
     delete_if_exists \
       "gcloud compute network-endpoint-groups describe '${NEG_NAMES[$i]}' --project='$PROJECT_ID' --region='$REGION'" \
       gcloud compute network-endpoint-groups delete "${NEG_NAMES[$i]}" \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --quiet
+        --project="$PROJECT_ID" --region="$REGION" --quiet
   done
 
-  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+  if ! cert_mode_is_classic_managed && [[ -n "$WILDCARD_DOMAIN" ]]; then
     delete_certificate_resources "${CERT_NAMES[0]}" "${DNS_AUTH_NAMES[0]}"
   fi
+
+  if cert_mode_is_classic_managed; then
+    delete_classic_managed_certificate
+  fi
+}
+
+delete_classic_managed_certificate() {
+  delete_if_exists \
+    "gcloud compute ssl-certificates describe '$CLASSIC_CERT_NAME' --project='$PROJECT_ID' --global" \
+    gcloud compute ssl-certificates delete "$CLASSIC_CERT_NAME" \
+      --project="$PROJECT_ID" --global --quiet
 }
 
 delete_certificate_resources() {
@@ -345,18 +397,14 @@ delete_certificate_resources() {
   local auth_name="$2"
 
   delete_if_exists \
-    "gcloud certificate-manager certificates describe '$cert_name' --project='$PROJECT_ID' --location='$REGION'" \
+    "gcloud certificate-manager certificates describe '$cert_name' --project='$PROJECT_ID' --location='$(cert_location)'" \
     gcloud certificate-manager certificates delete "$cert_name" \
-      --project="$PROJECT_ID" \
-      --location="$REGION" \
-      --quiet
+      --project="$PROJECT_ID" --location="$(cert_location)" --quiet
 
   delete_if_exists \
-    "gcloud certificate-manager dns-authorizations describe '$auth_name' --project='$PROJECT_ID' --location='$REGION'" \
+    "gcloud certificate-manager dns-authorizations describe '$auth_name' --project='$PROJECT_ID' --location='$(cert_location)'" \
     gcloud certificate-manager dns-authorizations delete "$auth_name" \
-      --project="$PROJECT_ID" \
-      --location="$REGION" \
-      --quiet
+      --project="$PROJECT_ID" --location="$(cert_location)" --quiet
 }
 
 delete_cloudflare_dns_records() {
@@ -366,7 +414,7 @@ delete_cloudflare_dns_records() {
     find_cloudflare_zone_for_host "${HOSTS[$i]}"
     delete_cloudflare_dns_record_if_present "$CF_RESOLVED_ZONE_ID" "A" "${HOSTS[$i]}"
 
-    if [[ -z "$WILDCARD_DOMAIN" ]]; then
+    if ! cert_mode_is_classic_managed && [[ -z "$WILDCARD_DOMAIN" ]]; then
       auth_record_name="$(strip_trailing_dot "$(get_dns_auth_record_name_if_present "${DNS_AUTH_NAMES[$i]}")")"
       if [[ -n "$auth_record_name" ]]; then
         delete_cloudflare_dns_record_if_present "$CF_RESOLVED_ZONE_ID" "CNAME" "$auth_record_name"
@@ -376,7 +424,7 @@ delete_cloudflare_dns_records() {
     fi
   done
 
-  if [[ -n "$WILDCARD_DOMAIN" ]]; then
+  if ! cert_mode_is_classic_managed && [[ -n "$WILDCARD_DOMAIN" ]]; then
     auth_record_name="$(strip_trailing_dot "$(get_dns_auth_record_name_if_present "${DNS_AUTH_NAMES[0]}")")"
     if [[ -n "$auth_record_name" ]]; then
       find_cloudflare_zone_for_host "$WILDCARD_DOMAIN"
@@ -387,87 +435,71 @@ delete_cloudflare_dns_records() {
   fi
 }
 
+delete_scoped() {
+  local kind="$1" name="$2"
+  if lb_is_global; then
+    delete_if_exists \
+      "gcloud compute $kind describe '$name' --project='$PROJECT_ID' --global" \
+      gcloud compute "$kind" delete "$name" --project="$PROJECT_ID" --global --quiet
+  else
+    delete_if_exists \
+      "gcloud compute $kind describe '$name' --project='$PROJECT_ID' --region='$REGION'" \
+      gcloud compute "$kind" delete "$name" --project="$PROJECT_ID" --region="$REGION" --quiet
+  fi
+}
+
 delete_lb_core() {
-  delete_if_exists \
-    "gcloud compute forwarding-rules describe '$HTTP_FWD_RULE_NAME' --project='$PROJECT_ID' --region='$REGION'" \
-    gcloud compute forwarding-rules delete "$HTTP_FWD_RULE_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --quiet
-
-  delete_if_exists \
-    "gcloud compute forwarding-rules describe '$HTTPS_FWD_RULE_NAME' --project='$PROJECT_ID' --region='$REGION'" \
-    gcloud compute forwarding-rules delete "$HTTPS_FWD_RULE_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --quiet
-
-  delete_if_exists \
-    "gcloud compute target-http-proxies describe '$HTTP_PROXY_NAME' --project='$PROJECT_ID' --region='$REGION'" \
-    gcloud compute target-http-proxies delete "$HTTP_PROXY_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --quiet
-
-  delete_if_exists \
-    "gcloud compute target-https-proxies describe '$HTTPS_PROXY_NAME' --project='$PROJECT_ID' --region='$REGION'" \
-    gcloud compute target-https-proxies delete "$HTTPS_PROXY_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --quiet
-
-  delete_if_exists \
-    "gcloud compute url-maps describe '$REDIRECT_URL_MAP_NAME' --project='$PROJECT_ID' --region='$REGION'" \
-    gcloud compute url-maps delete "$REDIRECT_URL_MAP_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --quiet
-
-  delete_if_exists \
-    "gcloud compute url-maps describe '$URL_MAP_NAME' --project='$PROJECT_ID' --region='$REGION'" \
-    gcloud compute url-maps delete "$URL_MAP_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --quiet
+  delete_scoped forwarding-rules "$HTTP_FWD_RULE_NAME"
+  delete_scoped forwarding-rules "$HTTPS_FWD_RULE_NAME"
+  delete_scoped target-http-proxies "$HTTP_PROXY_NAME"
+  delete_scoped target-https-proxies "$HTTPS_PROXY_NAME"
+  delete_scoped url-maps "$REDIRECT_URL_MAP_NAME"
+  delete_scoped url-maps "$URL_MAP_NAME"
 }
 
 delete_optional_foundation() {
   if bool_is_true "$DELETE_ADDRESS"; then
-    delete_if_exists \
-      "gcloud compute addresses describe '$ADDRESS_NAME' --project='$PROJECT_ID' --region='$REGION'" \
-      gcloud compute addresses delete "$ADDRESS_NAME" \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --quiet
+    if lb_is_global; then
+      delete_if_exists \
+        "gcloud compute addresses describe '$ADDRESS_NAME' --project='$PROJECT_ID' --global" \
+        gcloud compute addresses delete "$ADDRESS_NAME" --project="$PROJECT_ID" --global --quiet
+    else
+      delete_if_exists \
+        "gcloud compute addresses describe '$ADDRESS_NAME' --project='$PROJECT_ID' --region='$REGION'" \
+        gcloud compute addresses delete "$ADDRESS_NAME" --project="$PROJECT_ID" --region="$REGION" --quiet
+    fi
   fi
 
-  if bool_is_true "$DELETE_NETWORK"; then
+  if bool_is_true "$DELETE_NETWORK" && ! lb_is_global; then
     delete_if_exists \
       "gcloud compute networks subnets describe '$PROXY_SUBNET' --project='$PROJECT_ID' --region='$REGION'" \
       gcloud compute networks subnets delete "$PROXY_SUBNET" \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --quiet
+        --project="$PROJECT_ID" --region="$REGION" --quiet
 
     delete_if_exists \
       "gcloud compute networks describe '$LB_NETWORK' --project='$PROJECT_ID'" \
-      gcloud compute networks delete "$LB_NETWORK" \
-        --project="$PROJECT_ID" \
-        --quiet
+      gcloud compute networks delete "$LB_NETWORK" --project="$PROJECT_ID" --quiet
   fi
 }
 
 print_summary() {
+  local scope_label
+  if lb_is_global; then
+    scope_label="Global"
+  else
+    scope_label="Regional ($REGION)"
+  fi
   cat <<EOF
 
 Uninstall summary
 -----------------
-Project:         $PROJECT_ID
-Region:          $REGION
-LB core deleted: $DELETE_LB_CORE
-Address deleted: $DELETE_ADDRESS
-Network deleted: $DELETE_NETWORK
-Cloudflare DNS:  $DELETE_CLOUDFLARE_DNS
+Scope:            $scope_label
+Project:          $PROJECT_ID
+Cloud Run region: $REGION
+LB core deleted:  $DELETE_LB_CORE
+Address deleted:  $DELETE_ADDRESS
+Network deleted:  $DELETE_NETWORK
+Cloudflare DNS:   $DELETE_CLOUDFLARE_DNS
 Mappings removed: ${#HOSTS[@]}
 EOF
 
@@ -484,6 +516,7 @@ main() {
   require_env PROJECT_ID
   require_env REGION
   require_env ADDRESS_NAME
+  validate_config
   require_cloudflare_cmds_if_enabled
   run gcloud config set project "$PROJECT_ID"
   parse_mappings

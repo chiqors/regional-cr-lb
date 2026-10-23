@@ -1,47 +1,63 @@
-# Regional Cloud Run LB Usage
+# Cloud Run LB Usage
 
-This setup uses a shared `Regional external managed Load Balancer` in front of one or more Cloud Run services. HTTPS is enabled by default, with an HTTP-only option.
+This setup puts a shared external Application Load Balancer in front of one or more Cloud Run services. You pick the scope — **regional** (default) or **global** — and the certificate strategy. HTTPS is enabled by default, with an HTTP-only option.
 
 What you get:
-- one shared regional static external IP
-- one shared regional load balancer
+- one shared external IP (regional or global)
+- one shared load balancer
 - one hostname per Cloud Run service
 - HTTP to HTTPS redirect
-- Google-managed regional certificates
+- choice of certificate strategy (Certificate Manager / classic Google-managed)
 - reusable add/remove flow for more services later
 
 ## Files
 
 - [01-create-ip-and-show-dns.sh](./01-create-ip-and-show-dns.sh)
-- [02-finish-regional-cloud-run-lb.sh](./02-finish-regional-cloud-run-lb.sh)
-- [03-uninstall-regional-cloud-run-lb.sh](./03-uninstall-regional-cloud-run-lb.sh)
+- [02-finish-cloud-run-lb.sh](./02-finish-cloud-run-lb.sh)
+- [03-uninstall-cloud-run-lb.sh](./03-uninstall-cloud-run-lb.sh)
 
 ## Mental Model
 
-Step 1 only reserves the shared IP.
+Step 1 reserves the shared IP.
 
 Step 2 creates or updates the shared load balancer and routes hostnames to Cloud Run services.
 
-Step 3 removes the shared load balancer resources and optionally also removes the IP and network.
+Step 3 removes the shared load balancer resources and optionally also removes the IP and (for regional) the network.
 
 One IP is shared across multiple hostnames. Routing happens by hostname, not by separate IPs.
 
-If you deploy multiple independent LBs in the same project and region, set a different `LB_NAME_PREFIX` for each deployment. The default resource names are shared, so omitting this would make later runs reuse the earlier LB's URL maps, proxies, and forwarding-rule names.
+If you deploy multiple independent LBs in the same project and region, set a different `LB_NAME_PREFIX` for each deployment.
+
+## Scope choice: regional vs global
+
+| Aspect | `LB_SCOPE=regional` (default) | `LB_SCOPE=global` |
+|---|---|---|
+| IP | regional, `STANDARD` tier allowed | global, `PREMIUM` tier only |
+| VPC + proxy-only subnet | created / required | not needed |
+| LB blast radius | one region | anycast, worldwide |
+| `CERT_MODE=managed` | ✅ Certificate Manager (regional) with DNS auth | ✅ Certificate Manager (global) with DNS auth |
+| `CERT_MODE=classic-managed` | ❌ not supported by Google | ✅ Google-managed classic SSL cert (`--domains`) |
+
+Cloud Run NEGs are always regional and bound to `REGION` regardless of scope.
 
 ## Inputs
 
 ### Common
 
 - `PROJECT_ID`
-- `REGION`
+- `REGION` (Cloud Run service region; still needed for global LB because NEGs bind here)
 - `ADDRESS_NAME`
+- `LB_SCOPE` (optional; `regional` (default) or `global`)
+- `NETWORK_TIER` (optional; defaults to `STANDARD` for regional and `PREMIUM` for global; global must be `PREMIUM`)
 
 ### Step 2 and Step 3
 
 - `SERVICE_MAPPINGS`
 - `WILDCARD_DOMAIN` (optional; use one certificate for `*.example.com` instead of one per hostname)
 - `ENABLE_HTTPS` (optional; defaults to `true`; set to `false` for an HTTP-only frontend on port 80)
-- `LB_NAME_PREFIX` (optional; use a unique value when deploying more than one LB in the same project and region)
+- `LB_NAME_PREFIX` (optional; defaults to `cloud-run-lb`)
+- `CERT_MODE` (optional; `managed` (default) uses Certificate Manager with Google-managed certs and DNS authorization; `classic-managed` uses a Google-managed classic SSL cert via `compute ssl-certificates --domains=...` — **requires `LB_SCOPE=global`**)
+- `CLASSIC_CERT_NAME` (optional; defaults to `${LB_NAME_PREFIX}-classic-cert`; only used with `CERT_MODE=classic-managed`)
 
 ### Optional Cloudflare DNS Automation
 
@@ -57,136 +73,117 @@ Format:
 SERVICE_MAPPINGS='host1.example.com=cloud-run-service-1,host2.example.com=cloud-run-service-2'
 ```
 
-Example:
-
-```bash
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service'
-```
-
 ## Step 1: Reserve The Shared IP
 
-This script only creates the regional static external IP.
+Regional (default):
 
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
+ADDRESS_NAME=my-lb-ip \
 ./01-create-ip-and-show-dns.sh
 ```
 
-Expected result:
-- a regional static external IP is created
-- the script prints the IP address
-
-If you only ran step 1 and want to undo it:
+Global:
 
 ```bash
-gcloud compute addresses delete my-regional-lb-ip \
-  --project=my-gcp-project \
-  --region=asia-southeast2
+PROJECT_ID=my-gcp-project \
+ADDRESS_NAME=my-global-lb-ip \
+LB_SCOPE=global \
+./01-create-ip-and-show-dns.sh
 ```
 
 ## Step 2: Create Or Update The Shared LB
 
-Run step 2 after step 1.
+Regional + managed certs (the default; same as the old regional-only setup):
 
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=cloud-run-reg-ext-lb-ip \
-SERVICE_MAPPINGS='dashboard-management.c-grhen.org=photon-dashboard-management,dashboard-trial.c-grhen.org=photon-dashboard,prototype.c-grhen.org=photon-prototype' \
-./02-finish-regional-cloud-run-lb.sh
+ADDRESS_NAME=my-lb-ip \
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
+./02-finish-cloud-run-lb.sh
+```
+
+Global + managed certs (Certificate Manager, DNS-authorized):
+
+```bash
+PROJECT_ID=my-gcp-project \
+REGION=asia-southeast2 \
+ADDRESS_NAME=my-global-lb-ip \
+LB_SCOPE=global \
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
+./02-finish-cloud-run-lb.sh
+```
+
+Global + classic Google-managed cert (`--domains`; the kind you see under "Classic certificates" in the Google Cloud console):
+
+```bash
+PROJECT_ID=my-gcp-project \
+REGION=asia-southeast2 \
+ADDRESS_NAME=my-global-lb-ip \
+LB_SCOPE=global \
+CERT_MODE=classic-managed \
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
+./02-finish-cloud-run-lb.sh
 ```
 
 What step 2 does:
-- creates or reuses the VPC and proxy-only subnet
-- creates or reuses one serverless NEG per hostname
+- creates or reuses a VPC and proxy-only subnet (regional only)
+- creates or reuses one serverless NEG per hostname (always regional)
 - creates or reuses one backend service per hostname
-- creates or updates the shared regional URL maps
-- by default, creates one DNS authorization and one Google-managed regional certificate per hostname
-- with `WILDCARD_DOMAIN`, creates one authorization for the parent domain and one shared wildcard certificate
-- when certificates are active, creates HTTPS and HTTP proxies plus forwarding rules
+- creates or updates the shared URL maps (regional or global per `LB_SCOPE`)
+- for `CERT_MODE=managed`: one DNS authorization and Certificate Manager certificate per hostname (or one wildcard set when `WILDCARD_DOMAIN` is set)
+- for `CERT_MODE=classic-managed`: one classic Google-managed cert covering every host via `--domains`
+- when certificates are usable, creates HTTPS and HTTP proxies plus forwarding rules
 - enables HTTP to HTTPS redirect
 
-By default, step 2 does not wait for certificates. If any are still provisioning, it prints the required DNS records and exits without creating the frontends. Rerun step 2 after the certificates become active.
+By default, step 2 does not wait for certificates to become `ACTIVE`. If any are still provisioning, it prints the required DNS records and exits. Rerun step 2 after the certificates become active.
+
+For `CERT_MODE=classic-managed`, the Google-managed cert can only reach `ACTIVE` after the forwarding rule exists AND DNS resolves to the LB IP, so step 2 creates the LB first and then (optionally with `WAIT_FOR_CERT=true`) polls for activation.
 
 ### HTTP-only mode
 
-To expose the regional load balancer over plain HTTP, set `ENABLE_HTTPS=false`:
-
-```bash
-PROJECT_ID=my-gcp-project \
-REGION=asia-southeast2 \
-ADDRESS_NAME=cloud-run-reg-ext-lb-ip \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
-ENABLE_HTTPS=false \
-./02-finish-regional-cloud-run-lb.sh
-```
-
-This creates only the regional HTTP proxy and forwarding rule on port 80. The normal host-based URL map is attached directly, so requests with `Host: api.example.com` or `Host: app.example.com` route to their matching Cloud Run service. Certificate Manager resources are not created or required. The existing HTTPS behavior remains the default when `ENABLE_HTTPS` is omitted.
-
-If you previously ran HTTPS mode, this updates the HTTP proxy to serve requests directly, but leaves existing HTTPS forwarding rules, proxies, certificates, and the redirect URL map in place. It does not delete existing resources.
+To expose the load balancer over plain HTTP only, set `ENABLE_HTTPS=false`. Certificate Manager resources are not created or required. Works for both scopes.
 
 ## DNS Records You Must Add
 
 For each hostname in `SERVICE_MAPPINGS`, create:
 
 - one `A` record pointing to the shared IP from step 1
-- in HTTPS mode, by default, one `_acme-challenge...` `CNAME` record printed by step 2
-- in HTTPS mode with `WILDCARD_DOMAIN`, only the one `CNAME` record printed for the parent domain
+- for `CERT_MODE=managed`, one `_acme-challenge...` `CNAME` record printed by step 2 (one per hostname, or one for the parent domain in wildcard mode)
+- for `CERT_MODE=classic-managed`, no extra records — Google issues the cert after DNS points at the LB
 
-HTTP-only mode does not need Certificate Manager DNS authorization records. Test a mapped hostname with its `Host` header, for example:
+## Optional: Share A Wildcard Certificate
 
-```bash
-curl -i -H 'Host: api.example.com' http://35.219.10.153/
-```
-
-Opening `http://35.219.10.153/` without a hostname uses the URL map's default backend (`SERVICE_MAPPINGS`' first entry).
-
-Example shape:
-
-```dns
-api.example.com.                       A      35.219.x.x
-app.example.com.                       A      35.219.x.x
-
-_acme-challenge_xxx.api.example.com.   CNAME  xxx.authorize.certificatemanager.goog.
-_acme-challenge_xxx.app.example.com.   CNAME  xxx.authorize.certificatemanager.goog.
-```
-
-### Optional: Share A Wildcard Certificate
-
-For one-level subdomains under the same parent domain, use a single wildcard certificate:
+Only applies to `CERT_MODE=managed`. For one-level subdomains under the same parent domain, use a single wildcard certificate:
 
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
+ADDRESS_NAME=my-lb-ip \
 WILDCARD_DOMAIN=example.com \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
-./02-finish-regional-cloud-run-lb.sh
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
+./02-finish-cloud-run-lb.sh
 ```
 
-Add the single Certificate Manager `CNAME` printed for `example.com` to DNS and keep it for renewals. Each mapped hostname still needs an `A` record pointing to the shared IP; Cloudflare automation can create these records and the wildcard `CNAME` instead. `*.example.com` covers `api.example.com` and `app.example.com`, but not `example.com` or `x.api.example.com`. All mappings must be covered by the wildcard.
-
-Keep `WILDCARD_DOMAIN` set on subsequent step 2 runs and when uninstalling. Switching an existing per-host setup to wildcard mode does not delete the old per-host certificates or DNS authorizations. Until the wildcard certificate is `ACTIVE`, step 2 leaves the existing HTTPS proxy unchanged; after it is active, step 2 attaches the wildcard certificate. Only then should you manually remove old per-host certificates and authorization CNAMEs if you no longer need them.
+Keep `WILDCARD_DOMAIN` set on subsequent step 2 runs and when uninstalling. `*.example.com` covers `api.example.com` and `app.example.com`, but not `example.com` or `x.api.example.com`.
 
 ## Optional: Create DNS Records In Cloudflare Automatically
 
 If you use Cloudflare DNS, step 2 can create or update:
 
 - one `A` record per hostname pointing to the shared load balancer IP
-- one ACME `CNAME` record per hostname, or one for the parent domain in wildcard mode
-
-Example:
+- for `CERT_MODE=managed`, one ACME `CNAME` record per hostname (or one for the parent domain in wildcard mode)
 
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
+ADDRESS_NAME=my-lb-ip \
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
 CLOUDFLARE_API_TOKEN=your-cloudflare-api-token \
 CLOUDFLARE_ZONE_NAME=example.com \
-./02-finish-regional-cloud-run-lb.sh
+./02-finish-cloud-run-lb.sh
 ```
 
 Notes:
@@ -194,108 +191,80 @@ Notes:
 - If `CLOUDFLARE_ZONE_ID` or `CLOUDFLARE_ZONE_NAME` is not set, the script tries to discover the zone from each hostname.
 - `CLOUDFLARE_A_PROXIED` defaults to `false`, which is the safe default for Google-managed certificate validation.
 - `CLOUDFLARE_TTL` defaults to `1`, which means Cloudflare automatic TTL.
-- The token should be able to edit DNS records. If you rely on zone auto-discovery, it also needs permission to read zones.
 
 ## When Certificates Are Still Provisioning
 
-This is normal on the first run. Certificate Manager DNS authorization can take several minutes to activate.
+This is normal on the first run.
 
-For a single run, set `WAIT_FOR_CERT=true`. Step 2 prints the required `A` and Certificate Manager `CNAME` records before polling. Add or verify those records in your DNS provider while the command remains running. Once all certificates are active, the script creates the proxies and forwarding rules automatically.
-
-The default wait timeout is one hour. Set `CERT_WAIT_TIMEOUT_SECONDS` to change it. If the command times out, it exits with an error; after resolving any DNS issue, rerun step 2.
-
-```bash
-WAIT_FOR_CERT=true \
-PROJECT_ID=my-gcp-project \
-REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
-./02-finish-regional-cloud-run-lb.sh
-```
+For a single run, set `WAIT_FOR_CERT=true`. Step 2 prints the required DNS records before polling. The default wait timeout is one hour; set `CERT_WAIT_TIMEOUT_SECONDS` to change it.
 
 ## Add Another Service Later
-
-This setup is designed for reuse.
-
-To add another hostname and Cloud Run service later:
 
 1. Add a new `A` record for the new hostname pointing to the same shared IP.
 2. Append the new mapping to `SERVICE_MAPPINGS`.
 3. Rerun step 2.
 
-Example:
-
-```bash
-PROJECT_ID=my-gcp-project \
-REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service,admin.example.com=my-admin-service' \
-./02-finish-regional-cloud-run-lb.sh
-```
+For `CERT_MODE=classic-managed`, step 2 will not add new domains to an existing classic cert in place — delete the cert manually first, then rerun step 2 with the updated `SERVICE_MAPPINGS` so a new cert covering every host is created.
 
 ## Uninstall
 
-If you used `WILDCARD_DOMAIN` in step 2, set it to the same value when running step 3. Step 3 deletes the shared wildcard certificate and authorization once, even if `SERVICE_MAPPINGS` is empty; provide mappings to remove their backend services, NEGs, and optional Cloudflare `A` records. Per-host certificates created before switching to wildcard mode are not removed by wildcard uninstall.
+Pass the same `LB_SCOPE` and `CERT_MODE` that you used in step 2. If you used `WILDCARD_DOMAIN`, pass that too.
 
-### Remove LB Resources But Keep The IP
+Remove LB resources but keep the IP:
 
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
-./03-uninstall-regional-cloud-run-lb.sh
+ADDRESS_NAME=my-lb-ip \
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
+./03-uninstall-cloud-run-lb.sh
 ```
 
-### Remove LB Resources And Cloudflare DNS Records
+Remove LB resources and Cloudflare DNS records:
 
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
+ADDRESS_NAME=my-lb-ip \
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
 DELETE_CLOUDFLARE_DNS=true \
 CLOUDFLARE_API_TOKEN=your-cloudflare-api-token \
 CLOUDFLARE_ZONE_NAME=example.com \
-./03-uninstall-regional-cloud-run-lb.sh
+./03-uninstall-cloud-run-lb.sh
 ```
 
-### Remove LB Resources And The IP
+Remove LB resources and the IP:
 
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
+ADDRESS_NAME=my-lb-ip \
 DELETE_ADDRESS=true \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
-./03-uninstall-regional-cloud-run-lb.sh
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
+./03-uninstall-cloud-run-lb.sh
 ```
 
-### Remove LB Resources, IP, And Network
+Remove LB resources, IP, and (regional only) the custom VPC + proxy subnet:
 
 ```bash
 PROJECT_ID=my-gcp-project \
 REGION=asia-southeast2 \
-ADDRESS_NAME=my-regional-lb-ip \
+ADDRESS_NAME=my-lb-ip \
 DELETE_ADDRESS=true \
 DELETE_NETWORK=true \
-SERVICE_MAPPINGS='api.example.com=my-api-service,app.example.com=my-app-service' \
-./03-uninstall-regional-cloud-run-lb.sh
+SERVICE_MAPPINGS='api.example.com=my-api,app.example.com=my-app' \
+./03-uninstall-cloud-run-lb.sh
 ```
 
-If you do not use `DELETE_CLOUDFLARE_DNS=true`, remove the DNS records manually from your DNS provider:
-- `A` records
-- `_acme-challenge...` `CNAME` records
+`DELETE_NETWORK=true` is ignored for `LB_SCOPE=global` because global LBs do not create a custom VPC.
 
 ## Notes
 
 - The scripts are idempotent and intended for reruns.
-- `PROJECT_ID`, `REGION`, and `ADDRESS_NAME` are required for all scripts.
+- `PROJECT_ID`, `REGION`, and `ADDRESS_NAME` are required for all scripts (`REGION` is still used by Cloud Run NEGs when `LB_SCOPE=global`).
 - `SERVICE_MAPPINGS` is required for step 2 and optional in step 3.
 - Cloudflare automation in step 2 is enabled when `CLOUDFLARE_API_TOKEN` is set.
 - Resource names are auto-generated from hostnames and truncated to fit GCP limits.
 - The scripts are written to work with macOS system Bash.
 - Cloudflare automation uses `curl` and `python3`.
 - The setup assumes all mapped Cloud Run services are in the same region.
-- The ADC quota-project warning from `gcloud` does not block this setup.
-- The Python deprecation warning from `gcloud` does not block this setup.
